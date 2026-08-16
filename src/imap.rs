@@ -528,10 +528,26 @@ fn flags_str(msg: &Message) -> String {
 }
 
 /// Converts a Proton message to RFC822: original Header + decrypted body.
+/// Fetches a full message, retrying a few times so a transient API hiccup
+/// (rate limit, network) doesn't produce an empty body the client would cache.
+async fn fetch_full(session: &Session, id: &str) -> Option<Message> {
+    for attempt in 0..3u32 {
+        match session.client.get_message(id).await {
+            Ok(m) => return Some(m),
+            Err(e) => {
+                eprintln!("IMAP get_message {id} attempt {} failed: {e}", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+    None
+}
+
 async fn build_rfc822(session: &Session, meta: &Message) -> String {
-    let full = match session.client.get_message(&meta.id).await {
-        Ok(m) => m,
-        Err(_) => return synth_headers(meta) + "\r\n\r\n(message unavailable)",
+    let full = match fetch_full(session, &meta.id).await {
+        Some(m) => m,
+        None => return synth_headers(meta) + "\r\n\r\n(message unavailable)",
     };
     let body = if full.is_encrypted == 0 {
         full.body.clone()
@@ -549,10 +565,10 @@ async fn build_rfc822(session: &Session, meta: &Message) -> String {
 }
 
 async fn header_block(session: &Session, meta: &Message) -> String {
-    match session.client.get_message(&meta.id).await {
-        Ok(m) if !m.header.trim().is_empty() => format!("{}\r\n\r\n", m.header.trim_end()),
-        Ok(m) => format!("{}\r\n\r\n", synth_headers(&m)),
-        Err(_) => format!("{}\r\n\r\n", synth_headers(meta)),
+    match fetch_full(session, &meta.id).await {
+        Some(m) if !m.header.trim().is_empty() => format!("{}\r\n\r\n", m.header.trim_end()),
+        Some(m) => format!("{}\r\n\r\n", synth_headers(&m)),
+        None => format!("{}\r\n\r\n", synth_headers(meta)),
     }
 }
 
