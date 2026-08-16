@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Local session & runtime state (contains encrypted credentials and per-account data)
+sessions.json
+uidmap.json
+
+# Self-signed TLS material
+*.der
+*.pem
+
+# Editor / OS noise
+*.swp
+.DS_Store
