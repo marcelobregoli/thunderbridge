@@ -61,8 +61,15 @@
     if (typeof m === 'string') {
       try { m = JSON.parse(m); } catch (_) { return null; }
     }
-    const t = m.token || (m.payload && m.payload.token);
-    if (t && /captcha/i.test(JSON.stringify(m))) return t;
+    if (typeof m !== 'object') return null;
+    const token = m.token || (m.payload && m.payload.token) || (m.data && m.data.token);
+    if (!token) return null;
+    // Proton delivers the solved token as {type:'pm_captcha', token} and
+    // {type:'HUMAN_VERIFICATION_SUCCESS', payload:{token,...}}. Accept either by the
+    // message kind, and fall back to a substring check for other/newer shapes.
+    const kind = String(m.type || (m.payload && m.payload.type) || '');
+    if (/captcha|human[_-]?verification/i.test(kind)) return token;
+    if (/captcha|human[_-]?verification/i.test(JSON.stringify(m))) return token;
     return null;
   }
 
@@ -90,7 +97,13 @@
   // Classic listener (for cases posted to the same origin).
   w.addEventListener('message', function (e) {
     const t = fromMessage(e.data);
-    if (t) deliver(t);
+    if (t) { deliver(t); return; }
+    // Surface unrecognized messages so a future format change is easy to diagnose.
+    try {
+      const d = e.data;
+      const kind = d && (d.type || (d.payload && d.payload.type));
+      if (kind) console.debug('[thunderbridge] ignored message:', kind);
+    } catch (_) {}
   }, true);
 
   console.log('%c[thunderbridge] HV capture active — solve the CAPTCHA, the rest is automatic.', 'color:#0f0');

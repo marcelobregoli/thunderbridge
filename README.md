@@ -146,6 +146,46 @@ Tampermonkey). It runs on `verify.proton.me`, captures the solved CAPTCHA token,
 POSTs it to the running `auth` command, so no copy-paste is needed. It does not solve the
 CAPTCHA; you still solve it yourself.
 
+`auth` opens the verification page in your **system default browser**, so the userscript
+manager must be installed and enabled in that browser.
+
+### Verify the script is running
+
+Open DevTools (F12) → Console on the `verify.proton.me` page. You should see:
+
+```
+[thunderbridge] HV capture active — solve the CAPTCHA, the rest is automatic.
+```
+
+After you solve the CAPTCHA it logs `token captured -> sending to thunderbridge`. If the
+`HV capture active` line is missing, the script is not running (see below).
+
+### Chromium browsers (Chrome, Brave, Edge)
+
+Under Manifest V3, Tampermonkey needs userscripts explicitly allowed or it silently runs
+nothing — and a browser update can reset this. If the `HV capture active` line does not
+appear, in the browser that opened the page:
+
+1. Open the extensions page (`brave://extensions`, `chrome://extensions`, ...).
+2. Enable **Developer mode** (top-right toggle), and/or open **Tampermonkey → Details**
+   and enable **Allow User Scripts** if that toggle is present.
+3. Confirm the extension and the `thunderbridge HV token capture` script are both enabled,
+   then reload `verify.proton.me`.
+
+### Manual fallback
+
+Without the userscript, paste this into the DevTools Console on `verify.proton.me`
+**before** solving the CAPTCHA, then copy the printed token into the terminal prompt:
+
+```js
+addEventListener('message', (e) => {
+  let m = e.data;
+  if (typeof m === 'string') { try { m = JSON.parse(m); } catch (_) { return; } }
+  const t = m && (m.token || (m.payload && m.payload.token));
+  if (t) console.log('%cTOKEN >>> ' + t, 'color:#0f0;font-size:16px');
+}, true);
+```
+
 ## Security notes
 
 - All servers bind to `127.0.0.1` only.
