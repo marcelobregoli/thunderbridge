@@ -5,7 +5,9 @@
 //! folder's messages; UIDs are persistent (uidmap.json). FETCH serves
 //! metadata/ENVELOPE/body (PGP-decrypted); STORE \Seen reflects read/unread back to Proton.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
@@ -14,6 +16,23 @@ use tokio_rustls::TlsAcceptor;
 use crate::proton::messages::Message;
 use crate::session::Session;
 use crate::uidmap::UidStore;
+
+/// State shared by every connection: the one authenticated session (so a single `Client`
+/// with its serialized refresh chain owns the single-use refresh token — concurrent
+/// connections no longer race and invalidate each other's tokens) plus a short-lived
+/// per-folder listing cache (so Thunderbird's many overlapping SELECTs of a big folder
+/// don't each re-page the entire folder from Proton's slow deep pagination).
+struct SharedState {
+    session: tokio::sync::Mutex<Option<Arc<Session>>>,
+    folder_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<CachedFolder>>>>>,
+}
+type SharedSession = Arc<SharedState>;
+
+/// A cached folder listing with the instant it was fetched (for TTL expiry).
+struct CachedFolder {
+    at: Instant,
+    msgs: Arc<Vec<Msg>>,
+}
 
 /// Plain TCP IMAP listener.
 pub async fn serve(username: String, port: u16) -> anyhow::Result<()> {
@@ -36,26 +55,86 @@ async fn accept_loop(
         if tls.is_some() { " (TLS)" } else { "" }
     );
     let username = Arc::new(username);
+    let shared: SharedSession = Arc::new(SharedState {
+        session: tokio::sync::Mutex::new(None),
+        folder_locks: std::sync::Mutex::new(HashMap::new()),
+    });
     loop {
         let (tcp, peer) = listener.accept().await?;
         let username = username.clone();
         let tls = tls.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
             let res = match tls {
                 Some(acc) => match acc.accept(tcp).await {
-                    Ok(s) => handle_conn(s, &username).await,
+                    Ok(s) => handle_conn(s, &username, shared).await,
                     Err(e) => {
                         eprintln!("IMAP [{peer}] TLS handshake: {e}");
                         return;
                     }
                 },
-                None => handle_conn(tcp, &username).await,
+                None => handle_conn(tcp, &username, shared).await,
             };
-            if let Err(e) = res {
-                eprintln!("IMAP [{peer}] connection ended: {e}");
+            match res {
+                Ok(()) => eprintln!("IMAP [{peer}] connection closed by client"),
+                Err(e) => eprintln!("IMAP [{peer}] connection ended: {e}"),
             }
         });
     }
+}
+
+/// Returns the one shared authenticated session, opening it on the first successful login.
+/// The bridge password is validated on every call (a cheap decrypt of the stored session)
+/// so a wrong password is still rejected even when a session is already cached. Holding the
+/// lock across `Session::open` also serializes concurrent first-logins to a single open.
+async fn get_or_open_session(
+    shared: &SharedSession,
+    username: &str,
+    pass: &str,
+) -> anyhow::Result<Arc<Session>> {
+    crate::store::load(username, pass).map_err(|_| anyhow::anyhow!("invalid credentials"))?;
+    let mut guard = shared.session.lock().await;
+    if guard.is_none() {
+        let s = Session::open(username, pass).await?;
+        *guard = Some(Arc::new(s));
+    }
+    Ok(guard.as_ref().unwrap().clone())
+}
+
+/// Loads a folder listing through the shared cache. Concurrent SELECTs of the same folder
+/// serialize on a per-folder lock so only one actually re-pages Proton; a fetch newer than
+/// `TTL` is served straight from memory, which is what stops Thunderbird's overlapping
+/// re-SELECTs of a large folder from each triggering a fresh multi-second full load.
+async fn load_folder_cached(
+    shared: &SharedSession,
+    s: &Session,
+    label: &str,
+    uidmap: &mut UidStore,
+) -> anyhow::Result<Arc<Vec<Msg>>> {
+    const TTL: Duration = Duration::from_secs(300);
+    let lock = {
+        let mut locks = shared.folder_locks.lock().unwrap();
+        locks
+            .entry(label.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone()
+    };
+    let mut slot = lock.lock().await;
+    if let Some(cf) = slot.as_ref()
+        && cf.at.elapsed() < TTL
+    {
+        return Ok(cf.msgs.clone());
+    }
+    let (loaded, complete) = load_folder(s, label, uidmap).await?;
+    let msgs = Arc::new(loaded);
+    // Only cache a complete listing; a truncated one is served once but re-fetched next time.
+    if complete {
+        *slot = Some(CachedFolder {
+            at: Instant::now(),
+            msgs: msgs.clone(),
+        });
+    }
+    Ok(msgs)
 }
 
 /// A folder (system or custom).
@@ -63,9 +142,12 @@ async fn accept_loop(
 struct Folder {
     name: String,
     label: String,
+    /// RFC 6154 SPECIAL-USE attribute (e.g. "\\All"), empty for plain folders.
+    attr: String,
 }
 
 /// A message in the selected folder (persistent UID + metadata).
+#[derive(Clone)]
 struct Msg {
     uid: u32,
     meta: Message,
@@ -78,7 +160,13 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     async fn send(&mut self, s: &str) -> std::io::Result<()> {
-        self.writer.write_all(s.as_bytes()).await
+        self.writer.write_all(s.as_bytes()).await?;
+        self.writer.flush().await
+    }
+    /// Best-effort clean shutdown so the final TLS records + close_notify are sent
+    /// (the client may already be gone, so errors are ignored).
+    async fn shutdown(&mut self) {
+        let _ = self.writer.shutdown().await;
     }
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
         let mut buf = Vec::new();
@@ -99,24 +187,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     }
 }
 
-/// Proton system folders (display name -> label ID).
-const SYSTEM_FOLDERS: &[(&str, &str)] = &[
-    ("INBOX", "0"),
-    ("Archive", "6"),
-    ("Sent", "7"),
-    ("Drafts", "8"),
-    ("Spam", "4"),
-    ("Trash", "3"),
-    ("Starred", "10"),
-    ("All Mail", "5"),
+/// Proton system folders (display name -> label ID -> RFC 6154 SPECIAL-USE attribute).
+/// The attribute lets Thunderbird recognize special folders (notably "\All" for All Mail)
+/// instead of treating them as ordinary mailboxes.
+const SYSTEM_FOLDERS: &[(&str, &str, &str)] = &[
+    ("INBOX", "0", ""),
+    ("Archive", "6", "\\Archive"),
+    ("Sent", "7", "\\Sent"),
+    ("Drafts", "8", "\\Drafts"),
+    ("Spam", "4", "\\Junk"),
+    ("Trash", "3", "\\Trash"),
+    ("Starred", "10", "\\Flagged"),
+    ("All Mail", "5", "\\All"),
 ];
 
 async fn build_folders(s: &Session) -> Vec<Folder> {
     let mut folders: Vec<Folder> = SYSTEM_FOLDERS
         .iter()
-        .map(|(n, l)| Folder {
+        .map(|(n, l, a)| Folder {
             name: n.to_string(),
             label: l.to_string(),
+            attr: a.to_string(),
         })
         .collect();
     // Custom folders/labels (best-effort).
@@ -128,6 +219,7 @@ async fn build_folders(s: &Session) -> Vec<Folder> {
             folders.push(Folder {
                 name: l.name,
                 label: l.id,
+                attr: String::new(),
             });
         }
     }
@@ -137,6 +229,7 @@ async fn build_folders(s: &Session) -> Vec<Folder> {
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     username: &str,
+    shared: SharedSession,
 ) -> anyhow::Result<()> {
     let (r, w) = split(stream);
     let mut c = Conn {
@@ -145,7 +238,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
     };
     c.send("* OK thunderbridge IMAP4rev1 ready\r\n").await?;
 
-    let mut session: Option<Session> = None;
+    let mut session: Option<Arc<Session>> = None;
     let mut folders: Vec<Folder> = Vec::new();
     let mut mailbox: Vec<Msg> = Vec::new();
     let mut selected_label: Option<String> = None;
@@ -166,9 +259,16 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
             (cmd_up.clone(), args, false)
         };
 
+        // TEMP diagnostics: trace the raw command exchange (password redacted).
+        if eff_cmd == "LOGIN" {
+            eprintln!("IMAP <- {tag} LOGIN <redacted>");
+        } else {
+            eprintln!("IMAP <- {line}");
+        }
+
         match eff_cmd.as_str() {
             "CAPABILITY" => {
-                c.send("* CAPABILITY IMAP4rev1 IDLE UIDPLUS LITERAL+\r\n").await?;
+                c.send("* CAPABILITY IMAP4rev1 IDLE UIDPLUS LITERAL+ SPECIAL-USE LIST-EXTENDED\r\n").await?;
                 c.send(&format!("{tag} OK CAPABILITY completed\r\n")).await?;
             }
             "LOGIN" => {
@@ -179,7 +279,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         toks.get(1).cloned().unwrap_or_default(),
                     )
                 };
-                match Session::open(username, &pass).await {
+                match get_or_open_session(&shared, username, &pass).await {
                     Ok(s) => {
                         folders = build_folders(&s).await;
                         session = Some(s);
@@ -201,8 +301,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             "LIST" | "LSUB" => {
                 for f in &folders {
+                    let attrs = if f.attr.is_empty() {
+                        "\\HasNoChildren".to_string()
+                    } else {
+                        format!("\\HasNoChildren {}", f.attr)
+                    };
                     c.send(&format!(
-                        "* {eff_cmd} (\\HasNoChildren) \"/\" \"{}\"\r\n",
+                        "* {eff_cmd} ({attrs}) \"/\" \"{}\"\r\n",
                         f.name
                     ))
                     .await?;
@@ -223,10 +328,10 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     c.send(&format!("{tag} NO no such mailbox\r\n")).await?;
                     continue;
                 };
-                let s = session.as_ref().unwrap();
-                match load_folder(s, &folder.label, &mut uidmap).await {
+                let s = session.as_ref().unwrap().clone();
+                match load_folder_cached(&shared, &s, &folder.label, &mut uidmap).await {
                     Ok(msgs) => {
-                        mailbox = msgs;
+                        mailbox = (*msgs).clone();
                         selected_label = Some(folder.label.clone());
                         let n = mailbox.len();
                         let uidvalidity = uidmap.uidvalidity(&folder.label);
@@ -241,29 +346,49 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         c.send(&format!("* OK [UNSEEN {}] first unseen\r\n", unseen)).await?;
                         let access = if eff_cmd == "EXAMINE" { "READ-ONLY" } else { "READ-WRITE" };
                         c.send(&format!("{tag} OK [{access}] {eff_cmd} completed\r\n")).await?;
+                        eprintln!("IMAP -> {} SELECT OK: {n} EXISTS (unseen {unseen}, uidnext {uidnext})", folder.name);
                     }
                     Err(e) => {
                         c.send(&format!("{tag} NO {e}\r\n")).await?;
+                        eprintln!("IMAP -> {} SELECT FAILED: {e}", folder.name);
                     }
                 }
             }
             "STATUS" => {
                 // STATUS "<mbox>" (items)
                 let name = unquote(eff_args.split('(').next().unwrap_or("INBOX").trim());
-                let label = folders
+                let Some(folder) = folders
                     .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&name))
-                    .map(|f| f.label.clone())
-                    .unwrap_or_else(|| "0".to_string());
+                    .cloned()
+                else {
+                    c.send(&format!("{tag} NO no such mailbox\r\n")).await?;
+                    continue;
+                };
+                let label = folder.label.clone();
+                // Real counts: the currently selected folder is served from memory; any other
+                // folder is loaded through the shared cache (cheap after a warm load) so
+                // Thunderbird sees non-zero MESSAGES/UNSEEN for folders it never keeps selected,
+                // notably All Mail. `uidnext`/`uidvalidity` are read after the load so a
+                // first-time STATUS reports current UIDs.
+                let (n, unseen) = if Some(&label) == selected_label.as_ref() {
+                    let unseen = mailbox.iter().filter(|m| m.meta.unread != 0).count();
+                    (mailbox.len(), unseen)
+                } else if let Some(s) = session.as_ref() {
+                    match load_folder_cached(&shared, s, &label, &mut uidmap).await {
+                        Ok(msgs) => {
+                            let unseen = msgs.iter().filter(|m| m.meta.unread != 0).count();
+                            (msgs.len(), unseen)
+                        }
+                        Err(_) => (0, 0),
+                    }
+                } else {
+                    (0, 0)
+                };
                 let uidvalidity = uidmap.uidvalidity(&label);
                 let uidnext = uidmap.uidnext(&label);
-                let n = if Some(&label) == selected_label.as_ref() {
-                    mailbox.len()
-                } else {
-                    0
-                };
                 c.send(&format!(
-                    "* STATUS \"{name}\" (MESSAGES {n} UIDNEXT {uidnext} UIDVALIDITY {uidvalidity} UNSEEN 0 RECENT 0)\r\n"
+                    "* STATUS \"{name}\" (MESSAGES {n} UIDNEXT {uidnext} UIDVALIDITY {uidvalidity} UNSEEN {unseen} RECENT 0)\r\n"
                 ))
                 .await?;
                 c.send(&format!("{tag} OK STATUS completed\r\n")).await?;
@@ -273,8 +398,9 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     c.send(&format!("{tag} NO not authenticated\r\n")).await?;
                     continue;
                 }
-                handle_fetch(&mut c, session.as_ref().unwrap(), &mailbox, eff_args, is_uid).await?;
+                let n = handle_fetch(&mut c, session.as_ref().unwrap(), &mailbox, eff_args, is_uid).await?;
                 c.send(&format!("{tag} OK FETCH completed\r\n")).await?;
+                eprintln!("IMAP -> FETCH OK: {n} messages returned");
             }
             "STORE" => {
                 if let (Some(s), Some(label)) = (session.as_ref(), selected_label.as_ref()) {
@@ -313,22 +439,43 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
         }
     }
+    c.shutdown().await;
     Ok(())
 }
 
 /// Fetches ALL of a folder's messages by paging, assigns persistent UIDs, sorts by UID.
+/// Returns `(messages, complete)`. `complete` is false when a mid-folder API hiccup cut the
+/// paging short; the caller then serves the partial listing but must NOT cache it, so the
+/// next SELECT/STATUS retries instead of pinning a truncated folder for the cache TTL.
 async fn load_folder(
     s: &Session,
     label: &str,
     uidmap: &mut UidStore,
-) -> anyhow::Result<Vec<Msg>> {
+) -> anyhow::Result<(Vec<Msg>, bool)> {
+    // Safety backstop only. Loading the whole folder keeps the IMAP UID set stable (a
+    // sliding "newest N" window would silently drop low-UID messages with no EXPUNGE, which
+    // desyncs Thunderbird). A first cold load of a few thousand messages stays under
+    // Thunderbird's connection timeout, and the shared cache makes every later SELECT cheap.
+    const MAX_MESSAGES: usize = 50_000;
     let mut metas: Vec<Message> = Vec::new();
     let mut page = 0;
+    let mut complete = true;
     loop {
-        let (total, msgs) = s.client.list_messages(label, page, 150).await?;
+        let (total, msgs) = match s.client.list_messages(label, page, 150).await {
+            Ok(v) => v,
+            // Tolerate a mid-folder API hiccup: return what we already have instead of
+            // failing the whole SELECT, which would leave the folder empty in the client.
+            // Mark the load incomplete so it is not cached.
+            Err(e) if !metas.is_empty() => {
+                eprintln!("  IMAP: {label} list stopped at page {page}: {e}");
+                complete = false;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let got = msgs.len();
         metas.extend(msgs);
-        if got == 0 || metas.len() >= total as usize || page > 300 {
+        if got == 0 || metas.len() >= total as usize || metas.len() >= MAX_MESSAGES {
             break;
         }
         page += 1;
@@ -336,6 +483,8 @@ async fn load_folder(
             eprintln!("  IMAP: {label} fetched {} messages...", metas.len());
         }
     }
+    // Keep only the newest MAX_MESSAGES (metas are newest-first before the time sort).
+    metas.truncate(MAX_MESSAGES);
     // Ascending time (oldest first) -> persistent UID; then order by UID.
     metas.sort_by_key(|m| m.time);
     let mut out: Vec<Msg> = metas
@@ -347,7 +496,7 @@ async fn load_folder(
         .collect();
     out.sort_by_key(|m| m.uid);
     uidmap.save();
-    Ok(out)
+    Ok((out, complete))
 }
 
 /// Resolves the FETCH set (seq or uid) and returns (seq, &Msg) pairs.
@@ -388,11 +537,13 @@ async fn handle_fetch<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mailbox: &[Msg],
     args: &str,
     is_uid: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let (set, items) = split_once_ws(args);
     let items_up = items.to_ascii_uppercase();
 
-    for (seq, m) in select_targets(set, is_uid, mailbox) {
+    let targets = select_targets(set, is_uid, mailbox);
+    let count = targets.len();
+    for (seq, m) in targets {
         let msg = &m.meta;
         let mut parts: Vec<String> = Vec::new();
 
@@ -443,7 +594,7 @@ async fn handle_fetch<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         c.send(&format!("* {seq} FETCH ({})\r\n", parts.join(" "))).await?;
     }
-    Ok(())
+    Ok(count)
 }
 
 async fn handle_store<S: AsyncRead + AsyncWrite + Unpin + Send>(

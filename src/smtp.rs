@@ -57,7 +57,8 @@ struct Conn<S: AsyncRead + AsyncWrite + Unpin> {
 }
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     async fn send(&mut self, s: &str) -> std::io::Result<()> {
-        self.writer.write_all(s.as_bytes()).await
+        self.writer.write_all(s.as_bytes()).await?;
+        self.writer.flush().await
     }
     async fn line(&mut self) -> std::io::Result<Option<String>> {
         let mut buf = Vec::new();

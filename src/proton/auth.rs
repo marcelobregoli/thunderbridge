@@ -149,31 +149,22 @@ impl Client {
     }
 
     /// Obtains a new access token via the refresh token (captcha-free session renewal).
+    /// Also seeds the transport's refresh token so later access-token expiries are
+    /// renewed transparently on a 401.
     pub async fn auth_refresh(
         &mut self,
         uid: &str,
         refresh_token: &str,
     ) -> Result<Auth, ApiError> {
-        #[derive(Serialize)]
-        struct Req<'a> {
-            #[serde(rename = "RefreshToken")]
-            refresh_token: &'a str,
-            #[serde(rename = "ResponseType")]
-            response_type: &'a str,
-            #[serde(rename = "GrantType")]
-            grant_type: &'a str,
-            #[serde(rename = "RedirectURI")]
-            redirect_uri: &'a str,
-        }
         self.set_uid(uid.to_string());
-        let req = Req {
-            refresh_token,
-            response_type: "token",
-            grant_type: "refresh_token",
-            redirect_uri: "http://www.protonmail.ch",
-        };
-        let auth: Auth = self.post_json("/auth/refresh", &req, None).await?;
+        let auth = self.refresh_request(uid, refresh_token).await?;
         self.set_session(auth.uid.clone(), auth.access_token.clone());
+        let stored_refresh = if auth.refresh_token.is_empty() {
+            refresh_token.to_string()
+        } else {
+            auth.refresh_token.clone()
+        };
+        self.set_refresh_token(stored_refresh);
         Ok(auth)
     }
 

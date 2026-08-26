@@ -35,6 +35,21 @@ impl Session {
         }
         store::save_with_password(username, &cached, bridge_password)?;
 
+        // Persist rotated tokens whenever the transport auto-refreshes mid-session, so the
+        // on-disk refresh token (single-use) never falls behind the in-memory one.
+        let persist_user = username.to_string();
+        let persist_pw = bridge_password.to_string();
+        client.set_persist(move |uid, access, refresh| {
+            if let Ok(mut c) = store::load(&persist_user, &persist_pw) {
+                c.uid = uid.to_string();
+                c.access_token = access.to_string();
+                if !refresh.is_empty() {
+                    c.refresh_token = refresh.to_string();
+                }
+                let _ = store::save_with_password(&persist_user, &c, &persist_pw);
+            }
+        });
+
         let user = client.get_current_user().await?;
         let addresses = client.list_addresses().await?;
         // Salts were captured at login time (they can't be re-fetched after refresh
