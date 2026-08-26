@@ -97,6 +97,31 @@ cargo build --release
 
 ## Usage
 
+### Quick start (`run.sh`)
+
+A helper script wraps the two common steps (build + auth, build + serve over TLS):
+
+```sh
+./run.sh auth <proton-username>    # first time: log in, prints the bridge password
+./run.sh <proton-username>         # then: start IMAP+SMTP with TLS enabled
+```
+
+What it does:
+
+- `./run.sh auth <user>` — runs `cargo build --release`, then `thunderbridge auth <user>`.
+  You are prompted for your Proton password and, if needed, solve the CAPTCHA in the
+  browser (see [CAPTCHA userscript](#captcha-userscript)). On success it prints the
+  **bridge password** — save it, you enter it in your mail client.
+- `./run.sh <user>` — builds, then runs `thunderbridge serve <user> --tls` and prints the
+  host/port/security values to enter in Thunderbird.
+
+The script `cd`s to its own directory, so it works from anywhere. `Address already in
+use` on start means an instance is already running — most often the systemd service (see
+[Auto-start](#auto-start-systemd)); stop it first with `systemctl --user stop
+thunderbridge`, or just use the service instead of running the script by hand.
+
+The steps below explain each part in full.
+
 ### 1. Log in (once)
 
 ```sh
@@ -131,6 +156,55 @@ On the plain ports the client warns about an unencrypted connection; this is loo
 traffic that never leaves the machine. Use `--tls` to avoid the warning (you trust the
 self-signed certificate once).
 
+#### Thunderbird, step by step (TLS)
+
+When Thunderbird's account setup cannot autodetect the server, open **manual config** and
+enter the values by hand — do not leave "Autodetect", the self-signed certificate trips it
+up.
+
+**Incoming (IMAP):**
+
+| Field                 | Value                 |
+|-----------------------|-----------------------|
+| Protocol              | IMAP                  |
+| Hostname              | `127.0.0.1`           |
+| Port                  | `1993`                |
+| Connection security   | SSL/TLS               |
+| Authentication method | Normal password       |
+| Username              | your Proton address   |
+
+**Outgoing (SMTP):**
+
+| Field                 | Value                 |
+|-----------------------|-----------------------|
+| Hostname              | `127.0.0.1`           |
+| Port                  | `1465`                |
+| Connection security   | SSL/TLS               |
+| Authentication method | Normal password       |
+| Username              | your Proton address   |
+
+The password for both is the **bridge password**, not your Proton password. On first
+connect Thunderbird shows a certificate warning for the self-signed cert — choose **Confirm
+Security Exception** (permanent). The certificate is generated on your machine and stays
+stable across restarts, so you only accept it once.
+
+For the plain (non-TLS) ports use `1143` / `1025` with Connection security **None**.
+
+#### Only the Inbox shows up?
+
+Thunderbird subscribes to `INBOX` only by default, so All Mail, Sent, Drafts, Spam, Trash,
+Starred, and Archive can be missing at first even though the bridge serves them. To show
+them:
+
+- Right-click the account → **Subscribe…**, tick the folders you want, **OK**; or
+- **Account Settings → Server Settings → Advanced…** and untick **Show only subscribed
+  folders** to show every folder without subscribing.
+
+If the Subscribe list is empty, refresh the folder list first (right-click the account →
+**Refresh folder list**, or reopen the Subscribe dialog). The bridge tags special folders
+with RFC 6154 attributes (`\All` for All Mail, `\Sent`, `\Trash`, ...), so Thunderbird maps
+them to the right roles once they are subscribed.
+
 ### Auto-start (systemd)
 
 ```sh
@@ -138,6 +212,17 @@ thunderbridge install-service <proton-username>   # add --tls to enable TLS port
 systemctl --user daemon-reload
 systemctl --user enable --now thunderbridge
 ```
+
+The service runs the **installed** binary (e.g. `~/.local/bin/thunderbridge`), not
+`target/release`. After rebuilding, refresh it so the service picks up your changes:
+
+```sh
+cargo build --release
+cp -f target/release/thunderbridge ~/.local/bin/thunderbridge
+systemctl --user restart thunderbridge
+```
+
+Follow the logs with `journalctl --user -u thunderbridge -f`.
 
 ## CAPTCHA userscript
 
@@ -172,19 +257,63 @@ appear, in the browser that opened the page:
 3. Confirm the extension and the `thunderbridge HV token capture` script are both enabled,
    then reload `verify.proton.me`.
 
-### Manual fallback
+### Manual fallback (console, no userscript)
 
-Without the userscript, paste this into the DevTools Console on `verify.proton.me`
-**before** solving the CAPTCHA, then copy the printed token into the terminal prompt:
+If you cannot install a userscript manager, paste this into the DevTools Console on
+`verify.proton.me` **before** solving the CAPTCHA. It captures the solved token, tries to
+POST it to the running `auth` command automatically, and also copies it to the clipboard and
+prints it so you can paste it into the terminal `>` prompt if the auto-POST is blocked:
 
 ```js
-addEventListener('message', (e) => {
-  let m = e.data;
-  if (typeof m === 'string') { try { m = JSON.parse(m); } catch (_) { return; } }
-  const t = m && (m.token || (m.payload && m.payload.token));
-  if (t) console.log('%cTOKEN >>> ' + t, 'color:#0f0;font-size:16px');
-}, true);
+(() => {
+  const PORT = 8722, seen = new Set();
+
+  function fromMessage(m) {
+    if (!m) return null;
+    if (typeof m === 'string') { try { m = JSON.parse(m); } catch { return null; } }
+    if (typeof m !== 'object') return null;
+    const token = m.token || (m.payload && m.payload.token) || (m.data && m.data.token);
+    if (!token) return null;
+    const kind = String(m.type || (m.payload && m.payload.type) || '');
+    if (/captcha|human[_-]?verification/i.test(kind)) return token;
+    if (/captcha|human[_-]?verification/i.test(JSON.stringify(m))) return token;
+    return null;
+  }
+
+  function deliver(token) {
+    if (!token || seen.has(token)) return;
+    seen.add(token);
+    console.log('%c[thunderbridge] TOKEN captured:', 'color:#0f0;font-weight:bold');
+    console.log('%c' + token, 'color:#0f0');
+    try { navigator.clipboard.writeText(token); console.log('[thunderbridge] copied to clipboard'); } catch {}
+    try {
+      fetch('http://127.0.0.1:' + PORT + '/token', {
+        method: 'POST', body: token, headers: { 'Content-Type': 'text/plain' }, mode: 'no-cors'
+      }).then(() => console.log('%c[thunderbridge] sent to thunderbridge — back to the terminal.', 'color:#0f0'))
+        .catch(() => console.warn('[thunderbridge] auto-send blocked — paste the token into the terminal.'));
+    } catch { console.warn('[thunderbridge] auto-send blocked — paste the token into the terminal.'); }
+  }
+
+  // 1) Hook the page's window.parent.postMessage call.
+  try {
+    const orig = window.postMessage;
+    if (orig && !orig.__tb) {
+      const hooked = function (m) { const t = fromMessage(m); if (t) deliver(t); return orig.apply(this, arguments); };
+      hooked.__tb = true; window.postMessage = hooked;
+    }
+  } catch {}
+
+  // 2) Also listen for messages delivered to this window (iframe -> parent).
+  window.addEventListener('message', (e) => { const t = fromMessage(e.data); if (t) deliver(t); }, true);
+
+  console.log('%c[thunderbridge] HV capture active — solve the CAPTCHA, the rest is automatic.', 'color:#0f0;font-weight:bold');
+})();
 ```
+
+Browsers may block the cross-origin POST to `127.0.0.1` (Chrome/Brave Private Network
+Access); that is fine — the token is on your clipboard and in the console, so paste it into
+the terminal `>` prompt and press Enter. For a setup that always auto-delivers, install the
+userscript above instead.
 
 ## Security notes
 
