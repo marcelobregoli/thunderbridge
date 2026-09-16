@@ -47,7 +47,7 @@ raw ciphertext.
 
 | Module            | Responsibility |
 |-------------------|----------------|
-| `main.rs`         | CLI (clap): `auth`, `status`, `logout`, `imap`, `smtp`, `serve`, `install-service`. |
+| `main.rs`         | CLI (clap): `auth`, `status`, `logout`, `imap`, `smtp`, `serve`, `install-service`, `trust-thunderbird`, `export-cert`. |
 | `session.rs`      | Opens a stored session: refresh access token, load key-salts, unlock the PGP keyring. Shared by the IMAP and SMTP servers. |
 | `store.rs`        | On-disk session store. Session data is serialized to JSON and sealed with XChaCha20-Poly1305; the random key is handed to the user as the *bridge password* and never stored. |
 | `imap.rs`         | Hand-written IMAP4rev1 server. Lists all folders, fetches every message in a folder, serves ENVELOPE/BODY (PGP-decrypted), keeps persistent UIDs, and reflects `\Seen` back to Proton. |
@@ -183,12 +183,33 @@ up.
 | Authentication method | Normal password       |
 | Username              | your Proton address   |
 
-The password for both is the **bridge password**, not your Proton password. On first
-connect Thunderbird shows a certificate warning for the self-signed cert — choose **Confirm
-Security Exception** (permanent). The certificate is generated on your machine and stays
-stable across restarts, so you only accept it once.
+The password for both is the **bridge password**, not your Proton password.
 
-For the plain (non-TLS) ports use `1143` / `1025` with Connection security **None**.
+##### Trust the certificate first (important)
+
+Thunderbird's account-setup wizard does **not** offer the usual "Confirm Security
+Exception" dialog for a self-signed certificate — it just fails the connection test with
+**"Can't find a server"** (and the running service logs a `BadCertificate` TLS alert). So
+trust the certificate *before* adding the account:
+
+```sh
+# quit Thunderbird completely first, then:
+thunderbridge trust-thunderbird
+```
+
+This imports the bridge's self-signed certificate into every Thunderbird profile's NSS
+store (`cert9.db`) with CA + peer SSL trust, so the TLS ports validate cleanly. The
+certificate covers `localhost` and `127.0.0.1` and is stable across restarts, so you only
+do this once (re-run it if you ever delete the cert or add a new profile). Requires the
+NSS `certutil` tool (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`, Fedora: `nss-tools`).
+
+Now start Thunderbird and run the connection test — it succeeds without a warning.
+
+> Other clients (mutt, Evolution, ...): `thunderbridge export-cert` writes a PEM copy of
+> the certificate to import as trusted in that client instead.
+
+For the plain (non-TLS) ports use `1143` / `1025` with Connection security **None** — no
+certificate trust needed, since loopback traffic never leaves the machine.
 
 #### Only the Inbox shows up?
 

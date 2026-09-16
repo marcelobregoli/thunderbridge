@@ -36,6 +36,28 @@ fn load_or_generate() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     Ok((cert_der, key_der))
 }
 
+/// Path to the self-signed certificate (DER), generating it on first call.
+pub fn cert_der_path() -> anyhow::Result<PathBuf> {
+    let d = config_dir().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
+    load_or_generate()?; // ensure the cert/key exist on disk
+    Ok(d.join("tls-cert.der"))
+}
+
+/// The self-signed certificate as PEM text, generating it on first call.
+pub fn cert_pem() -> anyhow::Result<String> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    let (cert_der, _key) = load_or_generate()?;
+    let b64 = B64.encode(&cert_der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk)?);
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    Ok(out)
+}
+
 pub fn acceptor() -> anyhow::Result<TlsAcceptor> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let (cert_der, key_der) = load_or_generate()?;

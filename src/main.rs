@@ -73,6 +73,15 @@ enum Command {
         #[arg(long)]
         tls: bool,
     },
+    /// Trust the bridge's self-signed TLS certificate in Thunderbird (NSS), so the
+    /// SSL/TLS ports connect without a certificate error. Quit Thunderbird first.
+    TrustThunderbird,
+    /// Write a PEM copy of the self-signed TLS certificate (to trust in other clients).
+    ExportCert {
+        /// Output path for the PEM file (default: next to the DER cert).
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -93,6 +102,8 @@ async fn main() {
             smtps_port,
         } => run_serve(username, imap_port, smtp_port, tls, imaps_port, smtps_port).await,
         Command::InstallService { username, tls } => cmd_install_service(&username, tls),
+        Command::TrustThunderbird => cmd_trust_thunderbird(),
+        Command::ExportCert { out } => cmd_export_cert(out),
     };
     if let Err(e) = result {
         eprintln!("\nerror: {e}");
@@ -131,6 +142,119 @@ fn cmd_install_service(username: &str, tls: bool) -> anyhow::Result<()> {
     println!("\nStatus: systemctl --user status thunderbridge");
     println!("Logs:   journalctl --user -u thunderbridge -f");
     Ok(())
+}
+
+/// Trusts the self-signed TLS certificate in every local Thunderbird profile.
+///
+/// Thunderbird's account-setup wizard rejects a self-signed cert outright ("Can't find
+/// a server") instead of offering the security-exception dialog, so the reliable fix is
+/// to import the cert into each profile's NSS store (`cert9.db`) with CA+peer SSL trust.
+fn cmd_trust_thunderbird() -> anyhow::Result<()> {
+    if !certutil_available() {
+        anyhow::bail!(
+            "`certutil` not found — install the NSS tools and re-run:\n  \
+             Arch: sudo pacman -S nss   Debian/Ubuntu: sudo apt install libnss3-tools   Fedora: sudo dnf install nss-tools"
+        );
+    }
+    let cert = tls::cert_der_path()?;
+    let profiles = thunderbird_profiles();
+    if profiles.is_empty() {
+        anyhow::bail!(
+            "no Thunderbird profile found (looked under ~/.thunderbird, ~/.config/thunderbird, \
+             and the Flatpak path). Start Thunderbird once so it creates a profile, then re-run."
+        );
+    }
+    if thunderbird_running() {
+        println!(
+            "⚠  Thunderbird looks like it is running. Quit it completely first — NSS may otherwise overwrite this change."
+        );
+    }
+    const NICK: &str = "thunderbridge (local)";
+    let mut trusted = 0usize;
+    for p in &profiles {
+        let db = format!("sql:{}", p.display());
+        // Drop any stale entry (ignore failure), then add with CA+peer SSL trust.
+        let _ = std::process::Command::new("certutil")
+            .args(["-D", "-d", &db, "-n", NICK])
+            .output();
+        let status = std::process::Command::new("certutil")
+            .args(["-A", "-d", &db, "-n", NICK, "-t", "CP,,", "-i"])
+            .arg(&cert)
+            .status()?;
+        if status.success() {
+            println!("✓ trusted in {}", p.display());
+            trusted += 1;
+        } else {
+            eprintln!("✗ could not import into {}", p.display());
+        }
+    }
+    if trusted == 0 {
+        anyhow::bail!("failed to trust the certificate in any profile");
+    }
+    println!(
+        "\n✓ Done ({trusted} profile(s)). Start Thunderbird and use the TLS ports:\n  \
+         IMAP 127.0.0.1:1993 (SSL/TLS)   SMTP 127.0.0.1:1465 (SSL/TLS)"
+    );
+    Ok(())
+}
+
+/// Writes a PEM copy of the self-signed certificate for trusting in other mail clients.
+fn cmd_export_cert(out: Option<String>) -> anyhow::Result<()> {
+    let der_path = tls::cert_der_path()?;
+    let out_path = match out {
+        Some(p) => std::path::PathBuf::from(p),
+        None => der_path.with_file_name("tls-cert.pem"),
+    };
+    std::fs::write(&out_path, tls::cert_pem()?)?;
+    println!("✓ PEM certificate written: {}", out_path.display());
+    println!("  (DER original:           {})", der_path.display());
+    println!(
+        "\nImport it as a trusted certificate in your mail client to use the TLS ports without a warning.\n\
+         Thunderbird: `thunderbridge trust-thunderbird` does this automatically."
+    );
+    Ok(())
+}
+
+/// Whether the NSS `certutil` binary is available on PATH.
+fn certutil_available() -> bool {
+    std::process::Command::new("certutil")
+        .arg("-H")
+        .output()
+        .is_ok()
+}
+
+/// Best-effort check for a running Thunderbird (via `pgrep`); false if `pgrep` is absent.
+fn thunderbird_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "thunderbird"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Finds Thunderbird profile directories (any dir containing `prefs.js`) across the
+/// standard and Flatpak locations.
+fn thunderbird_profiles() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dirs) = directories::BaseDirs::new() {
+        let home = dirs.home_dir();
+        roots.push(home.join(".thunderbird"));
+        roots.push(home.join(".config/thunderbird"));
+        roots.push(home.join(".var/app/org.mozilla.Thunderbird/.thunderbird"));
+    }
+    let mut profiles = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() && path.join("prefs.js").exists() {
+                profiles.push(path);
+            }
+        }
+    }
+    profiles
 }
 
 /// Runs IMAP + SMTP (plaintext + optional TLS) concurrently.
