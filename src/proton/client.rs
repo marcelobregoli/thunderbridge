@@ -16,6 +16,7 @@ use reqwest::{header, Client as HttpClient, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use super::auth::Auth;
 
@@ -26,17 +27,47 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 /// Human-verification headers to attach to a request on resubmission.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HvHeaders {
     pub token: String,
     pub token_type: String,
 }
 
+impl std::fmt::Debug for HvHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HvHeaders")
+            .field("token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+impl Drop for HvHeaders {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
 /// Human-verification challenge parsed from a `9001` response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HumanVerification {
     pub methods: Vec<String>,
     pub token: String,
+}
+
+impl std::fmt::Debug for HumanVerification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HumanVerification")
+            .field("methods", &self.methods)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for HumanVerification {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +91,14 @@ struct AuthState {
     uid: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
+}
+
+impl Drop for AuthState {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.uid { value.zeroize(); }
+        if let Some(value) = &mut self.access_token { value.zeroize(); }
+        if let Some(value) = &mut self.refresh_token { value.zeroize(); }
+    }
 }
 
 /// Callback invoked with `(uid, access_token, refresh_token)` after a token rotation, so
@@ -220,7 +259,7 @@ impl Client {
         let resp = rb.send().await?;
         let text = resp.text().await?;
         serde_json::from_str(&text).map_err(|e| {
-            ApiError::Other(format!("invalid JSON response: {e}; body={}", truncate(&text)))
+            ApiError::Other(format!("invalid JSON response from Proton API: {e}"))
         })
     }
 
@@ -321,13 +360,4 @@ fn parse_hv(value: &Value) -> HumanVerification {
         .unwrap_or_default()
         .to_string();
     HumanVerification { methods, token }
-}
-
-fn truncate(s: &str) -> String {
-    let t: String = s.chars().take(300).collect();
-    if t.len() < s.len() {
-        format!("{t}…")
-    } else {
-        t
-    }
 }

@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::ServerConfig;
@@ -14,7 +16,20 @@ fn config_dir() -> Option<PathBuf> {
         .config_dir()
         .to_path_buf();
     std::fs::create_dir_all(&d).ok()?;
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).ok()?;
     Some(d)
+}
+
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn load_or_generate() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
@@ -23,6 +38,8 @@ fn load_or_generate() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let key_path = d.join("tls-key.der");
     if let (Ok(c), Ok(k)) = (std::fs::read(&cert_path), std::fs::read(&key_path))
         && !c.is_empty() && !k.is_empty() {
+            std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644))?;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
             return Ok((c, k));
         }
     let ck = rcgen::generate_simple_self_signed(vec![
@@ -31,8 +48,9 @@ fn load_or_generate() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     ])?;
     let cert_der = ck.cert.der().to_vec();
     let key_der = ck.signing_key.serialize_der();
-    std::fs::write(&cert_path, &cert_der).ok();
-    std::fs::write(&key_path, &key_der).ok();
+    std::fs::write(&cert_path, &cert_der)?;
+    std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644))?;
+    write_private(&key_path, &key_der)?;
     Ok((cert_der, key_der))
 }
 

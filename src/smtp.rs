@@ -72,6 +72,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 break;
             }
             if b != b'\r' {
+                if buf.len() >= 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "protocol line exceeds 64 KiB safety limit",
+                    ));
+                }
                 buf.push(b);
             }
         }
@@ -199,12 +205,16 @@ async fn smtp_auth<S: AsyncRead + AsyncWrite + Unpin + Send>(
 async fn read_data<S: AsyncRead + AsyncWrite + Unpin + Send>(
     c: &mut Conn<S>,
 ) -> anyhow::Result<Vec<u8>> {
+    const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
     let mut out = Vec::new();
     while let Some(line) = c.line().await? {
         if line == "." {
             break;
         }
         let l = line.strip_prefix('.').unwrap_or(&line);
+        if out.len().saturating_add(l.len()).saturating_add(2) > MAX_MESSAGE_BYTES {
+            anyhow::bail!("SMTP message exceeds the 25 MiB safety limit");
+        }
         out.extend_from_slice(l.as_bytes());
         out.extend_from_slice(b"\r\n");
     }

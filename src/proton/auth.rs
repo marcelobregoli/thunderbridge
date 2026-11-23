@@ -6,6 +6,7 @@
 //! can be reused across a human-verification retry.
 
 use proton_srp::{SRPAuth, SRPProofB64, SrpHashVersion};
+use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 
 use super::client::{ApiError, Client, HvHeaders};
@@ -55,6 +56,15 @@ pub struct Auth {
     pub server_proof: String,
     #[serde(rename = "2FA", default)]
     pub two_factor: TwoFactor,
+}
+
+impl Drop for Auth {
+    fn drop(&mut self) {
+        self.uid.zeroize();
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+        self.server_proof.zeroize();
+    }
 }
 
 #[derive(Serialize)]

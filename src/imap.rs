@@ -180,6 +180,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                 break;
             }
             if b != b'\r' {
+                if buf.len() >= 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "protocol line exceeds 64 KiB safety limit",
+                    ));
+                }
                 buf.push(b);
             }
         }

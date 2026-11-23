@@ -4,6 +4,7 @@
 // @match        https://verify.proton.me/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
 // ==/UserScript==
@@ -18,27 +19,33 @@
   'use strict';
 
   const PORT = 8722;
+  const nonce = new URL(location.href).searchParams.get('tb_nonce');
+  if (!nonce || !/^[A-Za-z0-9_-]{32}$/.test(nonce)) return;
+  const endpoint = 'http://127.0.0.1:' + PORT + '/token/' + encodeURIComponent(nonce);
   const seen = new Set();
 
   function deliver(token) {
     if (!token || seen.has(token)) return;
     seen.add(token);
-    console.log('%c[thunderbridge] token captured -> sending to thunderbridge', 'color:#0f0');
     try {
       GM_xmlhttpRequest({
         method: 'POST',
-        url: 'http://127.0.0.1:' + PORT + '/token',
+        url: endpoint,
         data: token,
         headers: { 'Content-Type': 'text/plain' },
-        onload: function () {
-          banner('Sent to thunderbridge — you can return to the terminal.', '#0b3d0b');
+        onload: function (response) {
+          if (response.status >= 200 && response.status < 300) {
+            banner('Sent to the local bridge — you can return to the terminal.', '#0b3d0b');
+          } else {
+            banner('Local bridge rejected the callback. Stop authentication and retry; the token was not displayed.', '#5a1a1a');
+          }
         },
         onerror: function () {
-          banner('Could not reach thunderbridge (is `auth` running?). Token:\n' + token, '#5a1a1a');
+          banner('Could not reach the local bridge. Stop authentication and retry; the token was not displayed.', '#5a1a1a');
         },
       });
     } catch (e) {
-      banner('GM_xmlhttpRequest unavailable. Token (paste it manually):\n' + token, '#5a1a1a');
+      banner('Local token delivery is unavailable. Stop authentication and retry; the token was not displayed.', '#5a1a1a');
     }
   }
 

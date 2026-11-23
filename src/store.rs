@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -37,7 +39,7 @@ pub enum StoreError {
 }
 
 /// Data persisted on disk, sufficient to reconstruct a Proton session for the bridge.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CachedSession {
     pub uid: String,
     pub access_token: String,
@@ -47,6 +49,16 @@ pub struct CachedSession {
     pub mailbox_password: String,
     /// Raw `/keys/salts` response (used to unlock keys later).
     pub key_salts: serde_json::Value,
+}
+
+impl Drop for CachedSession {
+    fn drop(&mut self) {
+        self.uid.zeroize();
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+        self.login_password.zeroize();
+        self.mailbox_password.zeroize();
+    }
 }
 
 impl CachedSession {
@@ -68,6 +80,7 @@ fn store_path() -> Result<PathBuf, StoreError> {
         .ok_or(StoreError::NoConfigDir)?;
     let dir = dirs.config_dir().to_path_buf();
     fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("sessions.json"))
 }
 
@@ -84,7 +97,15 @@ fn read_all() -> Result<HashMap<String, String>, StoreError> {
 fn write_all(map: &HashMap<String, String>) -> Result<(), StoreError> {
     let path = store_path()?;
     let data = serde_json::to_string_pretty(map)?;
-    fs::write(&path, data)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -96,10 +117,10 @@ fn store_blob(username: &str, session: &CachedSession, key: &[u8; 32]) -> Result
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| StoreError::BadPassword)?;
     let nonce = XNonce::try_from(&nonce_bytes[..]).map_err(|_| StoreError::Decrypt)?;
 
-    let plaintext = serde_json::to_vec(session)?;
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_ref())
-        .map_err(|_| StoreError::Decrypt)?;
+    let mut plaintext = serde_json::to_vec(session)?;
+    let encrypted = cipher.encrypt(&nonce, plaintext.as_ref());
+    plaintext.zeroize();
+    let ciphertext = encrypted.map_err(|_| StoreError::Decrypt)?;
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     blob.extend_from_slice(&nonce_bytes);
@@ -168,11 +189,12 @@ pub fn load(username: &str, bridge_password: &str) -> Result<CachedSession, Stor
     let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes).map_err(|_| StoreError::BadPassword)?;
     key_bytes.zeroize();
     let nonce = XNonce::try_from(&blob[..NONCE_LEN]).map_err(|_| StoreError::Decrypt)?;
-    let plaintext = cipher
+    let mut plaintext = cipher
         .decrypt(&nonce, &blob[NONCE_LEN..])
         .map_err(|_| StoreError::Decrypt)?;
-
-    Ok(serde_json::from_slice(&plaintext)?)
+    let parsed = serde_json::from_slice(&plaintext);
+    plaintext.zeroize();
+    Ok(parsed?)
 }
 
 pub fn list_usernames() -> Result<Vec<String>, StoreError> {

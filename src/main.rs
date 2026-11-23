@@ -13,6 +13,7 @@ mod tls;
 mod uidmap;
 
 use std::io::{self, Write};
+use zeroize::Zeroize;
 
 use clap::{Parser, Subcommand};
 
@@ -51,7 +52,7 @@ enum Command {
         #[arg(long, default_value_t = 1025)]
         port: u16,
     },
-    /// Run IMAP + SMTP together (plaintext + optional TLS ports).
+    /// Run IMAP + SMTP together (TLS-only listeners when --tls is supplied).
     Serve {
         username: String,
         #[arg(long, default_value_t = 1143)]
@@ -173,10 +174,8 @@ fn cmd_trust_thunderbird() -> anyhow::Result<()> {
     let mut trusted = 0usize;
     for p in &profiles {
         let db = format!("sql:{}", p.display());
-        // Drop any stale entry (ignore failure), then add with CA+peer SSL trust.
-        let _ = std::process::Command::new("certutil")
-            .args(["-D", "-d", &db, "-n", NICK])
-            .output();
+        // Never delete an existing trust entry. If this nickname already exists,
+        // certutil will fail safely and the user can inspect the profile first.
         let status = std::process::Command::new("certutil")
             .args(["-A", "-d", &db, "-n", NICK, "-t", "CP,,", "-i"])
             .arg(&cert)
@@ -257,7 +256,7 @@ fn thunderbird_profiles() -> Vec<std::path::PathBuf> {
     profiles
 }
 
-/// Runs IMAP + SMTP (plaintext + optional TLS) concurrently.
+/// Runs IMAP + SMTP concurrently; --tls selects encrypted-only listeners.
 async fn run_serve(
     username: String,
     imap_port: u16,
@@ -267,15 +266,8 @@ async fn run_serve(
     smtps_port: u16,
 ) -> anyhow::Result<()> {
     let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
-    {
-        let u = username.clone();
-        tasks.push(tokio::spawn(async move { imap::serve(u, imap_port).await }));
-    }
-    {
-        let u = username.clone();
-        tasks.push(tokio::spawn(async move { smtp::serve(u, smtp_port).await }));
-    }
     if tls {
+        // TLS mode must not also expose the plaintext IMAP/SMTP listeners.
         let acceptor = tls::acceptor()?;
         {
             let (u, acc) = (username.clone(), acceptor.clone());
@@ -289,6 +281,11 @@ async fn run_serve(
                 smtp::serve_tls(u, smtps_port, acc).await
             }));
         }
+    } else {
+        let u = username.clone();
+        tasks.push(tokio::spawn(async move { imap::serve(u, imap_port).await }));
+        let u = username.clone();
+        tasks.push(tokio::spawn(async move { smtp::serve(u, smtp_port).await }));
     }
     // Stop on the first error/exit.
     for t in tasks {
@@ -308,7 +305,7 @@ fn prompt_line(label: &str) -> anyhow::Result<String> {
 async fn cmd_auth(username: &str) -> anyhow::Result<()> {
     let mut client = Client::new()?;
 
-    let password = rpassword::prompt_password("Password: ")?;
+    let mut password = rpassword::prompt_password("Password: ")?;
 
     // Prepare the SRP proof.
     let prepared = client.prepare_auth(username, &password).await?;
@@ -343,6 +340,7 @@ async fn cmd_auth(username: &str) -> anyhow::Result<()> {
     // Fetch the key salts (needed to unlock keys later); if it fails, still save the session.
     let mut session =
         store::CachedSession::from_auth(&auth, password.clone(), mailbox_password);
+    password.zeroize();
     match client
         .get_json::<serde_json::Value>("/keys/salts")
         .await
@@ -351,7 +349,7 @@ async fn cmd_auth(username: &str) -> anyhow::Result<()> {
         Err(e) => eprintln!("warning: could not fetch key salts ({e}); will retry later"),
     }
 
-    let bridge_password = store::encrypt_and_save(username, &session)?;
+    let mut bridge_password = store::encrypt_and_save(username, &session)?;
 
     println!("\n✓ Login successful. Session saved encrypted.");
     println!("\n  Bridge password (enter this in Thunderbird, NOT your real Proton password):");
@@ -359,6 +357,7 @@ async fn cmd_auth(username: &str) -> anyhow::Result<()> {
     println!("\n  Thunderbird settings (once the servers are running):");
     println!("      IMAP  127.0.0.1:1143   user: {username}   password: bridge password");
     println!("      SMTP  127.0.0.1:1025   user: {username}   password: bridge password");
+    bridge_password.zeroize();
     Ok(())
 }
 

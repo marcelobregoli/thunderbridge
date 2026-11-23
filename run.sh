@@ -6,10 +6,9 @@
 #   ./run.sh auth <proton-kullanıcı-adı>    # ilk kurulum / yeniden giriş (bir kez)
 #   ./run.sh <proton-kullanıcı-adı>         # IMAP+SMTP sunucusunu TLS ile başlat
 #
-# İlk giriş sırasında Proton "human verification" (CAPTCHA) isteyebilir; tarayıcıda
-# verify.proton.me açılır. Ya userscript'i (tools/proton-hv-capture.user.js) kur, ya da
-# aşağıdaki konsol JS'ini kullan; token'ı otomatik gönderemezse çözülen token'ı
-# terminaldeki "> " istemine yapıştır.
+# İlk giriş sırasında Proton CAPTCHA isteyebilir. Gerekirse doğrulama sayfası açılır;
+# yalnızca gözden geçirilmiş userscript token'ı nonce-korumalı yerel callback'e iletir.
+# Callback çalışmazsa giriş iptal edilir; token terminale veya konsola yapıştırılmaz.
 
 set -euo pipefail
 
@@ -43,10 +42,8 @@ fi
 
 cat <<EOF
 [thunderbridge] TLS ile başlatılıyor. Thunderbird ayarları:
-  IMAP  (STARTTLS yok, düz):  127.0.0.1:1143
-  IMAPS (SSL/TLS):            127.0.0.1:1993
-  SMTP  (düz):                127.0.0.1:1025
-  SMTPS (SSL/TLS):            127.0.0.1:1465
+  IMAP  (SSL/TLS only):       127.0.0.1:1993
+  SMTP  (SSL/TLS only):       127.0.0.1:1465
   Parola: 'auth' çıktısındaki BRIDGE PASSWORD (Proton parolan değil).
 Durdurmak için Ctrl+C.
 EOF

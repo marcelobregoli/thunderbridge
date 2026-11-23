@@ -1,21 +1,31 @@
 # thunderbridge
 
+> **Security status — 24 November 2026:** This fork is experimental and is **not
+> approved for real Proton credentials yet**. The dependency audit still reports
+> RUSTSEC-2026-0387 (crypto-bigint 0.5.5) and RUSTSEC-2023-0071 (rsa 0.9.10).
+> Do not authenticate a real account or use this as a live mail bridge until those
+> cryptographic dependencies are patched and the project has meaningful tests.
+
+
 A small, self-hosted bridge that exposes a **ProtonMail** account to any standard mail
 client (Thunderbird, mutt, Evolution, ...) over local **IMAP** and **SMTP**. It speaks
 the ProtonMail web API, performs the SRP login (including 2FA and the human-verification
 CAPTCHA), unlocks your PGP keys locally, and presents your mailbox as an ordinary
 IMAP/SMTP server bound to `127.0.0.1`.
 
-Written in Rust. No telemetry and no third parties: everything runs on your machine, and
-your ProtonMail password is never written to disk in plaintext.
+Written in Rust. No telemetry or third-party bridge service: the local bridge connects
+directly to Proton's API. Your ProtonMail password is not intentionally persisted in
+plaintext.
 
 Not affiliated with or endorsed by Proton AG. Use it with your own account.
 
 ## Why this exists
 
 ProtonMail does not expose plain IMAP/SMTP. The official Proton Bridge requires a paid
-plan; this is an independent, open-source alternative that works with free accounts. It
-translates the standard mail protocols into ProtonMail API calls and performs all PGP
+plan; this is an independent, open-source alternative designed to support free-plan
+accounts through the unofficial Proton web API. Compatibility has not been validated
+against every account state or current Proton challenge flow. It translates standard mail
+protocols into Proton API calls and performs PGP
 encryption/decryption locally, so a normal mail client never sees the Proton API or the
 raw ciphertext.
 
@@ -25,7 +35,7 @@ raw ciphertext.
 
 ```
   Mail client (Thunderbird)
-        |  IMAP 1143 / SMTP 1025  (localhost, plain or TLS)
+        |  IMAPS 1993 / SMTPS 1465  (localhost, TLS only in --tls mode)
         v
   +-----------------------------+
   |         thunderbridge       |
@@ -72,9 +82,10 @@ raw ciphertext.
 
 - **Login and CAPTCHA.** Free-account third-party logins hit a `9001` CAPTCHA. The
   CAPTCHA only renders on Proton's own origin, so it cannot be embedded; the user solves
-  it in the browser and the solved token is captured by a userscript and delivered to
-  `auth` over `127.0.0.1:8722`. There is no automated solving. After the first login the
-  session is renewed with the refresh token, so the CAPTCHA rarely reappears.
+  it in the browser and the optional userscript delivers the solved token through a
+  nonce-protected callback bound to `127.0.0.1:8722`. There is no automated solving.
+  If the callback is unavailable, authentication fails closed. After first login the
+  session is renewed with the refresh token, so the CAPTCHA may not reappear.
 
 - **Key-salts scope.** The `/keys/salts` endpoint requires a short-lived post-login
   "password scope" that a refreshed token does not carry. thunderbridge captures the
@@ -111,7 +122,7 @@ What it does:
 - `./run.sh auth <user>` — runs `cargo build --release`, then `thunderbridge auth <user>`.
   You are prompted for your Proton password and, if needed, solve the CAPTCHA in the
   browser (see [CAPTCHA userscript](#captcha-userscript)). On success it prints the
-  **bridge password** — save it, you enter it in your mail client.
+  **bridge password** — save it securely; enter it in your mail client.
 - `./run.sh <user>` — builds, then runs `thunderbridge serve <user> --tls` and prints the
   host/port/security values to enter in Thunderbird.
 
@@ -130,15 +141,15 @@ thunderbridge auth <proton-username>
 
 You are asked for your ProtonMail password (and TOTP if 2FA is enabled). If Proton asks
 for human verification, solve the CAPTCHA in the browser window that opens; with the
-userscript installed (see below) the token is delivered automatically. On success a
-**bridge password** is printed. This is what you give your mail client, not your real
+reviewed userscript installed (see below) the token is delivered automatically. On
+success a **bridge password** is printed. This is what you give your mail client, not your real
 Proton password.
 
 ### 2. Run the bridge
 
 ```sh
 thunderbridge serve <proton-username>          # plain: IMAP 1143, SMTP 1025
-thunderbridge serve <proton-username> --tls    # also TLS: IMAPS 1993, SMTPS 1465
+thunderbridge serve <proton-username> --tls    # TLS-only: IMAP 1993, SMTP 1465
 ```
 
 ### 3. Configure the mail client
@@ -247,101 +258,32 @@ Follow the logs with `journalctl --user -u thunderbridge -f`.
 
 ## CAPTCHA userscript
 
-Install `tools/proton-hv-capture.user.js` in a userscript manager (Violentmonkey or
-Tampermonkey). It runs on `verify.proton.me`, captures the solved CAPTCHA token, and
-POSTs it to the running `auth` command, so no copy-paste is needed. It does not solve the
-CAPTCHA; you still solve it yourself.
+If Proton requires a CAPTCHA, the user must solve it manually in Proton's own
+verification page. The optional userscript at
+`tools/proton-hv-capture.user.js` only transfers the resulting token to the
+one-time local callback.
 
-`auth` opens the verification page in your **system default browser**, so the userscript
-manager must be installed and enabled in that browser.
+The callback uses a fresh 192-bit random path for each authentication attempt,
+accepts a maximum 4 KiB body, and listens only on `127.0.0.1:8722`. The userscript
+requires a userscript manager with `GM_xmlhttpRequest` and `unsafeWindow`
+permissions. It does not print or display the CAPTCHA token. If delivery fails,
+stop the authentication attempt and retry; do not paste tokens into random web
+pages, public chats, issue trackers, or shell command arguments.
 
-### Verify the script is running
-
-Open DevTools (F12) → Console on the `verify.proton.me` page. You should see:
-
-```
-[thunderbridge] HV capture active — solve the CAPTCHA, the rest is automatic.
-```
-
-After you solve the CAPTCHA it logs `token captured -> sending to thunderbridge`. If the
-`HV capture active` line is missing, the script is not running (see below).
-
-### Chromium browsers (Chrome, Brave, Edge)
-
-Under Manifest V3, Tampermonkey needs userscripts explicitly allowed or it silently runs
-nothing — and a browser update can reset this. If the `HV capture active` line does not
-appear, in the browser that opened the page:
-
-1. Open the extensions page (`brave://extensions`, `chrome://extensions`, ...).
-2. Enable **Developer mode** (top-right toggle), and/or open **Tampermonkey → Details**
-   and enable **Allow User Scripts** if that toggle is present.
-3. Confirm the extension and the `thunderbridge HV token capture` script are both enabled,
-   then reload `verify.proton.me`.
-
-### Manual fallback (console, no userscript)
-
-If you cannot install a userscript manager, paste this into the DevTools Console on
-`verify.proton.me` **before** solving the CAPTCHA. It captures the solved token, tries to
-POST it to the running `auth` command automatically, and also copies it to the clipboard and
-prints it so you can paste it into the terminal `>` prompt if the auto-POST is blocked:
-
-```js
-(() => {
-  const PORT = 8722, seen = new Set();
-
-  function fromMessage(m) {
-    if (!m) return null;
-    if (typeof m === 'string') { try { m = JSON.parse(m); } catch { return null; } }
-    if (typeof m !== 'object') return null;
-    const token = m.token || (m.payload && m.payload.token) || (m.data && m.data.token);
-    if (!token) return null;
-    const kind = String(m.type || (m.payload && m.payload.type) || '');
-    if (/captcha|human[_-]?verification/i.test(kind)) return token;
-    if (/captcha|human[_-]?verification/i.test(JSON.stringify(m))) return token;
-    return null;
-  }
-
-  function deliver(token) {
-    if (!token || seen.has(token)) return;
-    seen.add(token);
-    console.log('%c[thunderbridge] TOKEN captured:', 'color:#0f0;font-weight:bold');
-    console.log('%c' + token, 'color:#0f0');
-    try { navigator.clipboard.writeText(token); console.log('[thunderbridge] copied to clipboard'); } catch {}
-    try {
-      fetch('http://127.0.0.1:' + PORT + '/token', {
-        method: 'POST', body: token, headers: { 'Content-Type': 'text/plain' }, mode: 'no-cors'
-      }).then(() => console.log('%c[thunderbridge] sent to thunderbridge — back to the terminal.', 'color:#0f0'))
-        .catch(() => console.warn('[thunderbridge] auto-send blocked — paste the token into the terminal.'));
-    } catch { console.warn('[thunderbridge] auto-send blocked — paste the token into the terminal.'); }
-  }
-
-  // 1) Hook the page's window.parent.postMessage call.
-  try {
-    const orig = window.postMessage;
-    if (orig && !orig.__tb) {
-      const hooked = function (m) { const t = fromMessage(m); if (t) deliver(t); return orig.apply(this, arguments); };
-      hooked.__tb = true; window.postMessage = hooked;
-    }
-  } catch {}
-
-  // 2) Also listen for messages delivered to this window (iframe -> parent).
-  window.addEventListener('message', (e) => { const t = fromMessage(e.data); if (t) deliver(t); }, true);
-
-  console.log('%c[thunderbridge] HV capture active — solve the CAPTCHA, the rest is automatic.', 'color:#0f0;font-weight:bold');
-})();
-```
-
-Browsers may block the cross-origin POST to `127.0.0.1` (Chrome/Brave Private Network
-Access); that is fine — the token is on your clipboard and in the console, so paste it into
-the terminal `>` prompt and press Enter. For a setup that always auto-delivers, install the
-userscript above instead.
+Do not install the userscript until you have reviewed its source. The project is
+independent of Proton and is not endorsed or supported by Proton AG.
 
 ## Security notes
 
-- All servers bind to `127.0.0.1` only.
-- The on-disk session (`~/.config/thunderbridge/sessions.json`) is encrypted; the key is
-  the bridge password and is never stored.
-- Traffic to Proton is HTTPS/TLS. PGP decryption happens in memory, locally.
+- IMAP, SMTP and the CAPTCHA callback bind to `127.0.0.1` only.
+- The configuration directory is owner-only (`0700`); the encrypted session file,
+  UID metadata and TLS private key are owner-only (`0600`).
+- Session JSON is encrypted with XChaCha20-Poly1305; its random key is the bridge
+  password and is not stored alongside the ciphertext.
+- Temporary serialized session plaintext buffers are zeroized after encryption/decryption.
+- Traffic to Proton uses HTTPS/TLS. PGP decryption happens locally in memory.
+- These hardening measures do not constitute an independent security audit. Treat this
+  third-party bridge as experimental and do not rely on it as your only mail archive.
 - Treat the bridge password like a password: anyone who has it, with access to your
   machine, can read your mail.
 

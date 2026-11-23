@@ -6,6 +6,7 @@ use crate::proton::crypto::Keyring;
 use crate::proton::mail::Address;
 use crate::proton::Client;
 use crate::store::{self, CachedSession};
+use zeroize::{Zeroize, Zeroizing};
 
 #[allow(dead_code)] // cached/bridge_password kept for future reuse
 pub struct Session {
@@ -14,6 +15,12 @@ pub struct Session {
     pub addresses: Vec<Address>,
     pub cached: CachedSession,
     pub bridge_password: String,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.bridge_password.zeroize();
+    }
 }
 
 impl Session {
@@ -38,7 +45,7 @@ impl Session {
         // Persist rotated tokens whenever the transport auto-refreshes mid-session, so the
         // on-disk refresh token (single-use) never falls behind the in-memory one.
         let persist_user = username.to_string();
-        let persist_pw = bridge_password.to_string();
+        let persist_pw = Zeroizing::new(bridge_password.to_string());
         client.set_persist(move |uid, access, refresh| {
             if let Ok(mut c) = store::load(&persist_user, &persist_pw) {
                 c.uid = uid.to_string();

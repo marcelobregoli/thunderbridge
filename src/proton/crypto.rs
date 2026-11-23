@@ -14,6 +14,7 @@ use pgp::packet::PublicKeyEncryptedSessionKey;
 use pgp::ser::Serialize as PgpSerialize;
 use pgp::types::{Password, SigningKey};
 use proton_srp::mailbox_password_hash;
+use zeroize::Zeroize;
 
 use super::mail::{Address, KeySalt, User};
 
@@ -33,6 +34,12 @@ struct AddrKey {
     skey: SignedSecretKey,
     /// Key passphrase (Password is not Clone; built with Password::from when needed).
     pw: String,
+}
+
+impl Drop for AddrKey {
+    fn drop(&mut self) {
+        self.pw.zeroize();
+    }
 }
 
 /// Unlocked address keys; used to decrypt message bodies.
