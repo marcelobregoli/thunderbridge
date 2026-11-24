@@ -19,9 +19,8 @@ getrandom = "0.3"
 hex = "0.4.3"
 mail-parser = "0.11.6"
 open = "5.4.1"
-pgp = "0.21.1"
-proton-srp = "0.8.4"
-rand = "0.8"
+proton-srp = { version = "0.9.0", default-features = false, registry = "proton" }
+gopenpgp-sys = { version = "0.3.10", registry = "proton" }
 rcgen = "0.14.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 rpassword = "7.5.4"
@@ -32,3 +31,6 @@ tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 url = "2.5.9"
 zeroize = "1.9.0"
+
+[patch.proton]
+gopenpgp-sys = { path = "vendor/gopenpgp-sys" }

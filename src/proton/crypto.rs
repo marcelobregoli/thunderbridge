@@ -1,26 +1,25 @@
-//! PGP key unlocking and message decryption (rpgp 0.20).
+//! Proton account key unlocking and message crypto using Proton's GopenPGP backend.
 //!
-//! Proton's modern key model: the user key is unlocked with the bcrypt derivation of
-//! the mailbox password (proton-srp `mailbox_password_hash().hashed_password()`);
-//! address keys are unlocked via the `Token` field (encrypted to the user key). On
-//! older accounts the address key is unlocked directly with the bcrypt-derived password.
+//! SRP and PGP no longer use the older pure-Rust PGP / proton-srp 0.8
+//! dependency chain. SRP 0.9 is built without its legacy internal PGP verifier;
+//! the signed server modulus is verified with Proton's GopenPGP implementation.
 
+use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use pgp::composed::{ArmorOptions, Deserializable, Message, MessageBuilder, SignedPublicKey, SignedSecretKey};
-use pgp::crypto::hash::HashAlgorithm;
-use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::PublicKeyEncryptedSessionKey;
-use pgp::ser::Serialize as PgpSerialize;
-use pgp::types::{Password, SigningKey};
-use proton_srp::mailbox_password_hash;
-use zeroize::Zeroize;
+use gopenpgp_sys::{
+    DataEncoding, Decryptor, Encryptor, PrivateKey, PublicKey, SessionKey, SessionKeyAlgorithm,
+    VerificationStatus, Verifier,
+};
+#[cfg(test)]
+use gopenpgp_sys::{KeyGenerator, Signer};
+use proton_srp::{ModulusSignatureVerifier, ModulusVerifyError, mailbox_password_hash};
+use zeroize::Zeroizing;
 
 use super::mail::{Address, KeySalt, User};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
-    #[error("pgp: {0}")]
+    #[error("OpenPGP: {0}")]
     Pgp(String),
     #[error("no key salt: {0}")]
     NoSalt(String),
@@ -31,27 +30,49 @@ pub enum CryptoError {
 }
 
 struct AddrKey {
-    skey: SignedSecretKey,
-    /// Key passphrase (Password is not Clone; built with Password::from when needed).
-    pw: String,
+    skey: PrivateKey,
 }
 
-impl Drop for AddrKey {
-    fn drop(&mut self) {
-        self.pw.zeroize();
+/// Proton SRP's modulus verifier, implemented with Proton's Go-backed OpenPGP.
+/// Verification fails closed unless GopenPGP reports a valid signature.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProtonModulusVerifier;
+
+impl ModulusSignatureVerifier for ProtonModulusVerifier {
+    fn verify_and_extract_modulus(
+        &self,
+        modulus: &str,
+        server_key: &str,
+    ) -> Result<String, ModulusVerifyError> {
+        let public_key = PublicKey::import(server_key.as_bytes(), DataEncoding::Armor)
+            .map_err(|e| ModulusVerifyError::KeyImport(e.to_string()))?;
+        let verified = Verifier::new()
+            .with_verification_key(&public_key)
+            .verify_cleartext(modulus.as_bytes())
+            .map_err(|e| ModulusVerifyError::CleartextParse(e.to_string()))?;
+
+        let status = verified.verification_result().map(|result| result.status());
+        if !matches!(status, Some(VerificationStatus::Ok)) {
+            return Err(ModulusVerifyError::SignatureVerification(
+                "GopenPGP did not validate the SRP modulus signature".to_string(),
+            ));
+        }
+
+        String::from_utf8(verified.into_vec())
+            .map_err(|e| ModulusVerifyError::CleartextParse(e.to_string()))
     }
 }
 
-/// Unlocked address keys; used to decrypt message bodies.
-pub struct Keyring {
-    keys: Vec<AddrKey>,
+fn key_pw(mailbox_password: &str, salt: &[u8]) -> Result<String, CryptoError> {
+    let hash = mailbox_password_hash(mailbox_password, salt)
+        .map_err(|e| CryptoError::Pgp(format!("mailbox password hash: {e}")))?;
+    String::from_utf8(hash.hashed_password().to_vec())
+        .map_err(|e| CryptoError::Pgp(format!("mailbox password hash encoding: {e}")))
 }
 
-fn key_pw(mailbox_password: &str, salt: &[u8]) -> Result<String, CryptoError> {
-    let h = mailbox_password_hash(mailbox_password, salt)
-        .map_err(|e| CryptoError::Pgp(format!("bcrypt: {e:?}")))?;
-    // Proton PGP passphrase = the last 31 chars of the bcrypt hash (prefix+salt dropped).
-    Ok(String::from_utf8_lossy(h.hashed_password()).into_owned())
+/// Unlocked Proton address keys, retained only in the local GopenPGP process.
+pub struct Keyring {
+    keys: Vec<AddrKey>,
 }
 
 impl Keyring {
@@ -61,20 +82,28 @@ impl Keyring {
         salts: &[KeySalt],
         mailbox_password: &str,
     ) -> Result<Self, CryptoError> {
-        let salt_for = |id: &str| salts.iter().find(|s| s.id == id).and_then(|s| s.salt.clone());
+        let salt_for = |id: &str| {
+            salts
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.salt.clone())
+        };
 
-        // The user's primary key (address key tokens are encrypted to it).
         let user_key = user
             .keys
             .iter()
             .find(|k| k.primary == 1)
             .or_else(|| user.keys.first())
             .ok_or(CryptoError::NoKey)?;
-        let (user_skey, _) = SignedSecretKey::from_string(&user_key.private_key)
-            .map_err(|e| CryptoError::Pgp(format!("user key: {e}")))?;
         let user_salt =
             salt_for(&user_key.id).ok_or_else(|| CryptoError::NoSalt(user_key.id.clone()))?;
-        let user_pw = Password::from(key_pw(mailbox_password, &user_salt)?);
+        let user_pw = Zeroizing::new(key_pw(mailbox_password, &user_salt)?);
+        let user_skey = PrivateKey::import(
+            user_key.private_key.as_bytes(),
+            user_pw.as_bytes(),
+            DataEncoding::Armor,
+        )
+        .map_err(|e| CryptoError::Pgp(format!("user key unlock: {e}")))?;
 
         let mut keys = Vec::new();
         for addr in addresses {
@@ -82,157 +111,209 @@ impl Keyring {
                 if k.active != 1 {
                     continue;
                 }
-                let skey = match SignedSecretKey::from_string(&k.private_key) {
-                    Ok((s, _)) => s,
-                    Err(_) => continue,
-                };
-                let pw = if !k.token.is_empty() {
-                    // The token is a PGP message encrypted to the user key; decrypt → address passphrase.
-                    match decrypt_to_string(&k.token, &user_pw, &user_skey) {
-                        Ok(s) => s.trim().to_string(),
+
+                // Modern Proton accounts wrap the address-key passphrase in a PGP
+                // token encrypted to the primary user key. Older accounts derive it
+                // directly from the address key's own salt.
+                let passphrase = if !k.token.is_empty() {
+                    match decrypt_to_string(&k.token, &user_skey) {
+                        Ok(value) => {
+                            let value = Zeroizing::new(value);
+                            Zeroizing::new(value.trim().to_string())
+                        }
                         Err(_) => continue,
                     }
                 } else {
                     match salt_for(&k.id) {
-                        Some(s) => key_pw(mailbox_password, &s)?,
+                        Some(salt) => match key_pw(mailbox_password, &salt) {
+                            Ok(value) => Zeroizing::new(value),
+                            Err(_) => continue,
+                        },
                         None => continue,
                     }
                 };
-                keys.push(AddrKey { skey, pw });
+
+                match PrivateKey::import(
+                    k.private_key.as_bytes(),
+                    passphrase.as_bytes(),
+                    DataEncoding::Armor,
+                ) {
+                    Ok(skey) => keys.push(AddrKey { skey }),
+                    Err(_) => continue,
+                }
             }
         }
+
         if keys.is_empty() {
             return Err(CryptoError::NoKey);
         }
         Ok(Keyring { keys })
     }
 
-    /// Decrypts an armored PGP message body with the matching address key.
+    /// Decrypts an armored Proton message body with the matching address key.
     pub fn decrypt_body(&self, armored: &str) -> Result<String, CryptoError> {
-        for k in &self.keys {
-            let pw = Password::from(k.pw.clone());
-            if let Ok(s) = decrypt_to_string(armored, &pw, &k.skey) {
-                return Ok(s);
+        for key in &self.keys {
+            if let Ok(value) = decrypt_to_string(armored, &key.skey) {
+                return Ok(value);
             }
         }
         Err(CryptoError::DecryptFailed)
     }
 
-    /// Encrypts plaintext to the sender's (own) key as armored PGP (draft body).
+    /// Encrypts a draft body to the sender's own public key.
     pub fn encrypt_to_self(&self, plaintext: &str) -> Result<String, CryptoError> {
         let key = self.keys.first().ok_or(CryptoError::NoKey)?;
-        let pubkey = key.skey.to_public_key();
-        let mut rng = rand::thread_rng();
-        let mut builder =
-            MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
-                .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-        // Use the encryption subkey (the primary is often signing-only EdDSA).
-        if let Some(sub) = pubkey.public_subkeys.first() {
-            builder.encrypt_to_key(&mut rng, sub)
-        } else {
-            builder.encrypt_to_key(&mut rng, &pubkey)
-        }
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-        builder
-            .to_armored_string(&mut rng, ArmorOptions::default())
-            .map_err(|e| CryptoError::Pgp(e.to_string()))
+        let public_key = key
+            .skey
+            .to_public_key()
+            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
+        let message = Encryptor::new()
+            .with_encryption_key(&public_key)
+            .encrypt(plaintext.as_bytes())
+            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
+        String::from_utf8(
+            message
+                .armored()
+                .map_err(|e| CryptoError::Pgp(e.to_string()))?,
+        )
+        .map_err(|e| CryptoError::Pgp(e.to_string()))
     }
 
-    /// For sending: encrypts plaintext into a SEIPD body with a random session key.
-    /// Returns (base64 SEIPD packet, session key bytes). PKESK/cleartext keys are added
-    /// per-recipient on top of this.
-    pub fn seal_body(&self, plaintext: &str) -> Result<(String, Vec<u8>), CryptoError> {
+    /// Produces the signed SEIPD body packet and a zeroizing AES-256 session key.
+    /// Recipient-specific PKESK packets are added separately by the send workflow.
+    pub fn seal_body(&self, plaintext: &str) -> Result<(String, Zeroizing<Vec<u8>>), CryptoError> {
         let key = self.keys.first().ok_or(CryptoError::NoKey)?;
-        let mut rng = rand::thread_rng();
-        let sym = SymmetricKeyAlgorithm::AES256;
-        let sk = sym.new_session_key(&mut rng);
-        let sk_bytes = sk.as_ref().to_vec();
+        let session_key = SessionKey::generate(SessionKeyAlgorithm::Aes256)
+            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
+        let message = Encryptor::new()
+            .with_signing_key(&key.skey)
+            .with_session_key(&session_key)
+            .encrypt(plaintext.as_bytes())
+            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
 
-        let mut builder = MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
-            .seipd_v1(&mut rng, sym);
-        builder
-            .set_session_key(sk)
-            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-        // Sign with the sender's key (external cleartext recipients require a signature).
-        builder.sign(
-            &key.skey.primary_key as &dyn SigningKey,
-            Password::from(key.pw.clone()),
-            HashAlgorithm::Sha256,
-        );
-        // No ESK added → output is only the (signed) SEIPD packet; PKESK/cleartext key added on top.
-        let bytes = builder
-            .to_vec(&mut rng)
-            .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-        Ok((B64.encode(&bytes), sk_bytes))
+        let body_packet = message.data_packet();
+        let session_key_bytes = Zeroizing::new(session_key.export_token().as_ref().to_vec());
+        Ok((B64.encode(body_packet), session_key_bytes))
     }
-
 }
 
-/// Encrypts the session key as a PKESK for a recipient's armored public key (base64 packet).
+fn decrypt_to_string(armored: &str, key: &PrivateKey) -> Result<String, CryptoError> {
+    let decrypted = Decryptor::new()
+        .with_decryption_key(key)
+        .decrypt(armored.as_bytes(), DataEncoding::Armor)
+        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
+    String::from_utf8(decrypted.into_vec()).map_err(|e| CryptoError::Pgp(e.to_string()))
+}
+
+/// Encrypts a session key into a complete OpenPGP PKESK packet for a recipient.
 pub fn pkesk_for_recipient(
     session_key_bytes: &[u8],
     recipient_pubkey_armored: &str,
 ) -> Result<String, CryptoError> {
-    let (pubkey, _) = SignedPublicKey::from_string(recipient_pubkey_armored)
-        .map_err(|e| CryptoError::Pgp(format!("recipient key: {e}")))?;
-    let mut rng = rand::thread_rng();
-    let sym = SymmetricKeyAlgorithm::AES256;
-    // Rebuild the RawSessionKey from bytes.
-    let sk: pgp::composed::RawSessionKey = session_key_bytes.into();
-    // Prefer the encryption subkey (the primary may be signing-only).
-    let pkesk = if let Some(sub) = pubkey.public_subkeys.first() {
-        PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, &sk, sym, sub)
-    } else {
-        PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, &sk, sym, &pubkey)
-    }
-    .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-    let packet = frame_packet(
-        1,
-        &pkesk.to_bytes().map_err(|e| CryptoError::Pgp(e.to_string()))?,
-    );
-    Ok(B64.encode(&packet))
+    let public_key = PublicKey::import(recipient_pubkey_armored.as_bytes(), DataEncoding::Armor)
+        .map_err(|e| CryptoError::Pgp(format!("recipient public key: {e}")))?;
+    let session_key = SessionKey::from_token(session_key_bytes, SessionKeyAlgorithm::Aes256);
+    let packet = Encryptor::new()
+        .with_encryption_key(&public_key)
+        .encrypt_session_key(&session_key)
+        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
+    Ok(B64.encode(packet))
 }
 
-/// OpenPGP new-format packet header + body.
-fn frame_packet(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 6);
-    out.push(0xC0 | tag);
-    let len = body.len();
-    if len < 192 {
-        out.push(len as u8);
-    } else if len < 8384 {
-        let l = len - 192;
-        out.push(((l >> 8) as u8) + 192);
-        out.push((l & 0xff) as u8);
-    } else {
-        out.push(0xff);
-        out.extend_from_slice(&(len as u32).to_be_bytes());
-    }
-    out.extend_from_slice(body);
-    out
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn decrypt_to_string(
-    armored: &str,
-    pw: &Password,
-    skey: &SignedSecretKey,
-) -> Result<String, CryptoError> {
-    let (m, _) = Message::from_armor(armored.as_bytes())
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-    let mut dec = m
-        .decrypt(pw, skey)
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-    if let Ok(s) = dec.as_data_string() {
-        return Ok(s);
+    #[test]
+    fn proton_gopenpgp_round_trips_keyring_self_encryption() {
+        let private = KeyGenerator::new()
+            .with_user_id("Bridge Test", "bridge-test@example.invalid")
+            .generate()
+            .expect("generate test key");
+        let keyring = Keyring {
+            keys: vec![AddrKey {
+                skey: private.clone(),
+            }],
+        };
+        let armored = keyring
+            .encrypt_to_self("local PGP round-trip test")
+            .expect("encrypt to self");
+        let decrypted = decrypt_to_string(&armored, &private).expect("decrypt self message");
+        assert_eq!(decrypted, "local PGP round-trip test");
     }
-    // May be compressed: decrypt again + decompress.
-    let (m2, _) = Message::from_armor(armored.as_bytes())
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-    let mut dec2 = m2
-        .decrypt(pw, skey)
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?
-        .decompress()
-        .map_err(|e| CryptoError::Pgp(e.to_string()))?;
-    dec2.as_data_string()
-        .map_err(|e| CryptoError::Pgp(e.to_string()))
+
+    #[test]
+    fn proton_gopenpgp_round_trips_real_send_body_and_pkesk_functions() {
+        let private = KeyGenerator::new()
+            .with_user_id("Bridge Test", "bridge-test@example.invalid")
+            .generate()
+            .expect("generate test key");
+        let public = private.to_public_key().expect("export public key");
+        let public_armored = String::from_utf8(public.export(true).expect("armor public key"))
+            .expect("public key UTF-8");
+        let keyring = Keyring {
+            keys: vec![AddrKey {
+                skey: private.clone(),
+            }],
+        };
+        let plaintext = "split Proton body test";
+
+        let (body_b64, session_key_bytes) = keyring.seal_body(plaintext).expect("seal signed body");
+        let body_packet = B64.decode(body_b64).expect("decode body packet");
+        let pkesk_b64 = pkesk_for_recipient(&session_key_bytes, &public_armored)
+            .expect("create recipient PKESK");
+        let key_packet = B64.decode(pkesk_b64).expect("decode PKESK");
+
+        let recovered_key = Decryptor::new()
+            .with_decryption_key(&private)
+            .decrypt_session_key(&key_packet)
+            .expect("recover PKESK");
+        let decrypted = Decryptor::new()
+            .with_decryption_key(&private)
+            .with_session_key(&recovered_key)
+            .with_verification_key(&public)
+            .decrypt(&body_packet, DataEncoding::Bytes)
+            .expect("decrypt split body");
+        assert_eq!(decrypted.as_bytes(), plaintext.as_bytes());
+        assert!(matches!(
+            decrypted.verification_result().map(|r| r.status()),
+            Some(VerificationStatus::Ok)
+        ));
+    }
+
+    #[test]
+    fn proton_gopenpgp_verifies_signed_srp_modulus_text() {
+        let private = KeyGenerator::new()
+            .with_user_id("Bridge Test", "bridge-test@example.invalid")
+            .generate()
+            .expect("generate test key");
+        let public = private.to_public_key().expect("export public key");
+        let public_armored = String::from_utf8(public.export(true).expect("armor public key"))
+            .expect("public key UTF-8");
+        let signed_modulus = String::from_utf8(
+            Signer::new()
+                .with_signing_key(&private)
+                .sign_cleartext(b"test modulus")
+                .expect("sign modulus"),
+        )
+        .expect("signed modulus UTF-8");
+
+        let modulus = ProtonModulusVerifier
+            .verify_and_extract_modulus(&signed_modulus, &public_armored)
+            .expect("verify modulus");
+        assert_eq!(modulus, "test modulus");
+
+        let other_private = KeyGenerator::new()
+            .with_user_id("Wrong Test Key", "wrong-key@example.invalid")
+            .generate()
+            .expect("generate wrong key");
+        let other_public = other_private.to_public_key().expect("wrong public key");
+        let other_armored = String::from_utf8(other_public.export(true).expect("armor wrong key"))
+            .expect("wrong public key UTF-8");
+        assert!(
+            ProtonModulusVerifier
+                .verify_and_extract_modulus(&signed_modulus, &other_armored)
+                .is_err()
+        );
+    }
 }

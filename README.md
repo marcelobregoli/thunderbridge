@@ -1,16 +1,17 @@
 # thunderbridge
 
-> **Security status — 24 November 2026:** This fork is experimental and is **not
-> approved for real Proton credentials yet**. The dependency audit still reports
-> RUSTSEC-2026-0387 (crypto-bigint 0.5.5) and RUSTSEC-2023-0071 (rsa 0.9.10).
-> Do not authenticate a real account or use this as a live mail bridge until those
-> cryptographic dependencies are patched and the project has meaningful tests.
-
+> **Security status — 24 November 2026:** The updated Rust dependency graph has
+> zero cargo-audit advisories; the Proton Go crypto dependencies pass
+> govulncheck with no reachable vulnerabilities. Six security tests pass,
+> covering OpenPGP, SRP signature verification, encrypted session storage, and
+> SMTP authentication parsing. The fork remains experimental until a controlled
+> Proton Free account login and end-to-end mailbox/send test are completed.
 
 A small, self-hosted bridge that exposes a **ProtonMail** account to any standard mail
 client (Thunderbird, mutt, Evolution, ...) over local **IMAP** and **SMTP**. It speaks
 the ProtonMail web API, performs the SRP login (including 2FA and the human-verification
-CAPTCHA), unlocks your PGP keys locally, and presents your mailbox as an ordinary
+CAPTCHA), unlocks your PGP keys locally with Proton's Go-backed GopenPGP implementation,
+and presents your mailbox as an ordinary
 IMAP/SMTP server bound to `127.0.0.1`.
 
 Written in Rust. No telemetry or third-party bridge service: the local bridge connects
@@ -71,16 +72,16 @@ raw ciphertext.
 | Module          | Responsibility |
 |-----------------|----------------|
 | `client.rs`     | HTTP transport (reqwest + rustls). Adds the required app/version headers, decodes the API envelope, and turns a `9001` response into a typed human-verification error. |
-| `auth.rs`       | SRP login flow via `proton-srp`: fetch `/auth/info`, produce the client proof, submit `/auth`, verify the server proof; plus 2FA (TOTP) and refresh-token renewal. |
+| `auth.rs`       | SRP login via Proton proton-srp 0.9: fetch /auth/info, verify the signed modulus through GopenPGP, produce the client proof, submit /auth, verify the server proof; plus 2FA (TOTP) and refresh-token renewal. |
 | `humanverify.rs`| Resolves the `9001` CAPTCHA / email / SMS challenge. For CAPTCHA it opens the verification page and receives the solved token from a userscript over a local port. |
 | `mail.rs`       | Account layer: current user, addresses, PGP key structures, key-salts. |
 | `messages.rs`   | Message listing and single-message fetch; read/unread marking. |
-| `crypto.rs`     | PGP with `rpgp`: unlocks the keyring (user key via bcrypt-derived passphrase, address keys via the encrypted token), decrypts incoming bodies, and builds encrypted+signed bodies for sending. |
+| `crypto.rs`     | Proton GopenPGP backend: unlocks the keyring (user key via bcrypt-derived passphrase, address keys via the encrypted token), decrypts incoming bodies, and builds encrypted+signed bodies plus recipient PKESK packets for sending. |
 | `send.rs`       | Outbound pipeline: parse the client MIME, create a Proton draft, and build one send package per recipient (encrypted PKESK for Proton recipients, cleartext session key for external recipients). |
 
 ### Key technical points
 
-- **Login and CAPTCHA.** Free-account third-party logins hit a `9001` CAPTCHA. The
+- **Login and CAPTCHA.** Free-account third-party logins may trigger a `9001` CAPTCHA. The
   CAPTCHA only renders on Proton's own origin, so it cannot be embedded; the user solves
   it in the browser and the optional userscript delivers the solved token through a
   nonce-protected callback bound to `127.0.0.1:8722`. There is no automated solving.
@@ -101,10 +102,15 @@ raw ciphertext.
 
 ## Build
 
+Requirements: Rust, **Go 1.26 or newer**, and libclang plus Clang resource
+headers for the GopenPGP C bindings. On Fedora, build.sh discovers the
+installed libclang and resource headers automatically.
+
 ```sh
-cargo build --release
+./build.sh
 # binary: target/release/thunderbridge
 ```
+
 
 ## Usage
 
@@ -113,16 +119,17 @@ cargo build --release
 A helper script wraps the two common steps (build + auth, build + serve over TLS):
 
 ```sh
-./run.sh auth <proton-username>    # first time: log in, prints the bridge password
+./run.sh auth <proton-username>    # first time: log in, copies bridge password to clipboard
 ./run.sh <proton-username>         # then: start IMAP+SMTP with TLS enabled
 ```
 
 What it does:
 
-- `./run.sh auth <user>` — runs `cargo build --release`, then `thunderbridge auth <user>`.
+- `./run.sh auth <user>` — builds, then runs auth-local.sh to authenticate locally and copy the bridge password to the clipboard.
+- `./auth-local.sh [user]` — prompts for the username locally if omitted, uses no-echo password/OTP prompts, and copies the generated bridge password to the Wayland clipboard without displaying it. Requires wl-clipboard.
   You are prompted for your Proton password and, if needed, solve the CAPTCHA in the
-  browser (see [CAPTCHA userscript](#captcha-userscript)). On success it prints the
-  **bridge password** — save it securely; enter it in your mail client.
+  browser (see [CAPTCHA userscript](#captcha-userscript)). On success the **bridge
+  password** is copied to the Wayland clipboard without being displayed; paste it into Thunderbird.
 - `./run.sh <user>` — builds, then runs `thunderbridge serve <user> --tls` and prints the
   host/port/security values to enter in Thunderbird.
 
@@ -205,7 +212,7 @@ trust the certificate *before* adding the account:
 
 ```sh
 # quit Thunderbird completely first, then:
-thunderbridge trust-thunderbird
+./target/release/thunderbridge trust-thunderbird
 ```
 
 This imports the bridge's self-signed certificate into every Thunderbird profile's NSS
@@ -216,11 +223,12 @@ NSS `certutil` tool (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`, Fedora: `nss-t
 
 Now start Thunderbird and run the connection test — it succeeds without a warning.
 
-> Other clients (mutt, Evolution, ...): `thunderbridge export-cert` writes a PEM copy of
+> Other clients (mutt, Evolution, ...): `./target/release/thunderbridge export-cert` writes a PEM copy of
 > the certificate to import as trusted in that client instead.
 
-For the plain (non-TLS) ports use `1143` / `1025` with Connection security **None** — no
-certificate trust needed, since loopback traffic never leaves the machine.
+For troubleshooting only, the plain (non-TLS) ports are `1143` / `1025` with
+Connection security **None**. They are loopback-only, but TLS via `./run.sh` is
+the recommended configuration.
 
 #### Only the Inbox shows up?
 
@@ -249,7 +257,7 @@ The service runs the **installed** binary (e.g. `~/.local/bin/thunderbridge`), n
 `target/release`. After rebuilding, refresh it so the service picks up your changes:
 
 ```sh
-cargo build --release
+./build.sh
 cp -f target/release/thunderbridge ~/.local/bin/thunderbridge
 systemctl --user restart thunderbridge
 ```
@@ -289,8 +297,10 @@ independent of Proton and is not endorsed or supported by Proton AG.
 
 ## Dependencies of note
 
-`tokio`, `reqwest` (rustls), `proton-srp` (SRP), `rpgp` (OpenPGP), `chacha20poly1305`
-(session store), `tokio-rustls` + `rcgen` (TLS), `mail-parser`, `clap`.
+`tokio`, `reqwest` (rustls), Proton `proton-srp` 0.9 (SRP),
+Proton `gopenpgp-sys` / GopenPGP (OpenPGP; Go 1.26+),
+`chacha20poly1305` (session store), `tokio-rustls` + `rcgen` (TLS),
+`mail-parser`, and `clap`.
 
 ## License
 

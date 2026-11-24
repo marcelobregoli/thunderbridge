@@ -5,9 +5,10 @@
 //! is separated from submission (`submit_auth`) so that the same SRP session and proof
 //! can be reused across a human-verification retry.
 
+use super::crypto::ProtonModulusVerifier;
 use proton_srp::{SRPAuth, SRPProofB64, SrpHashVersion};
-use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use super::client::{ApiError, Client, HvHeaders};
 
@@ -89,13 +90,24 @@ pub struct PreparedAuth {
     expected_server_proof: String,
 }
 
+impl Drop for PreparedAuth {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.srp_session.zeroize();
+        self.client_ephemeral.zeroize();
+        self.client_proof.zeroize();
+        self.expected_server_proof.zeroize();
+    }
+}
+
 impl Client {
     pub async fn auth_info(
         &self,
         username: &str,
         hv: Option<&HvHeaders>,
     ) -> Result<AuthInfo, ApiError> {
-        self.post_json("/auth/info", &AuthInfoReq { username }, hv).await
+        self.post_json("/auth/info", &AuthInfoReq { username }, hv)
+            .await
     }
 
     /// Fetches `/auth/info` and produces the SRP client proof.
@@ -108,7 +120,8 @@ impl Client {
         let version = SrpHashVersion::try_from(info.version)
             .map_err(|e| ApiError::Other(format!("unsupported SRP version: {e}")))?;
 
-        let client = SRPAuth::with_pgp(
+        let client = SRPAuth::new(
+            &ProtonModulusVerifier,
             None,
             password,
             version,
@@ -161,11 +174,7 @@ impl Client {
     /// Obtains a new access token via the refresh token (captcha-free session renewal).
     /// Also seeds the transport's refresh token so later access-token expiries are
     /// renewed transparently on a 401.
-    pub async fn auth_refresh(
-        &mut self,
-        uid: &str,
-        refresh_token: &str,
-    ) -> Result<Auth, ApiError> {
+    pub async fn auth_refresh(&mut self, uid: &str, refresh_token: &str) -> Result<Auth, ApiError> {
         self.set_uid(uid.to_string());
         let auth = self.refresh_request(uid, refresh_token).await?;
         self.set_session(auth.uid.clone(), auth.access_token.clone());

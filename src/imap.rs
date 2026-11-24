@@ -9,13 +9,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::proton::messages::Message;
 use crate::session::Session;
 use crate::uidmap::UidStore;
+use zeroize::Zeroizing;
 
 /// State shared by every connection: the one authenticated session (so a single `Client`
 /// with its serialized refresh chain owns the single-use refresh token — concurrent
@@ -44,11 +47,7 @@ pub async fn serve_tls(username: String, port: u16, acceptor: TlsAcceptor) -> an
     accept_loop(username, port, Some(acceptor)).await
 }
 
-async fn accept_loop(
-    username: String,
-    port: u16,
-    tls: Option<TlsAcceptor>,
-) -> anyhow::Result<()> {
+async fn accept_loop(username: String, port: u16, tls: Option<TlsAcceptor>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!(
         "IMAP{}: listening on 127.0.0.1:{port} (user: {username})",
@@ -250,8 +249,10 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut selected_label: Option<String> = None;
     let mut uidmap = UidStore::load();
 
-    while let Some(line) = c.read_line().await? {
-        let (tag, rest) = split_tag(&line);
+    while let Some(raw_line) = c.read_line().await? {
+        // IMAP LOGIN carries the bridge password in this command line.
+        let line = Zeroizing::new(raw_line);
+        let (tag, rest) = split_tag(line.as_str());
         if tag.is_empty() {
             continue;
         }
@@ -269,23 +270,23 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
         if eff_cmd == "LOGIN" {
             eprintln!("IMAP <- {tag} LOGIN <redacted>");
         } else {
-            eprintln!("IMAP <- {line}");
+            eprintln!("IMAP <- {}", line.as_str());
         }
 
         match eff_cmd.as_str() {
             "CAPABILITY" => {
-                c.send("* CAPABILITY IMAP4rev1 IDLE UIDPLUS LITERAL+ SPECIAL-USE LIST-EXTENDED\r\n").await?;
-                c.send(&format!("{tag} OK CAPABILITY completed\r\n")).await?;
+                c.send(
+                    "* CAPABILITY IMAP4rev1 IDLE UIDPLUS LITERAL+ SPECIAL-USE LIST-EXTENDED\r\n",
+                )
+                .await?;
+                c.send(&format!("{tag} OK CAPABILITY completed\r\n"))
+                    .await?;
             }
             "LOGIN" => {
-                let (_user, pass) = {
-                    let toks = tokenize(eff_args);
-                    (
-                        toks.first().cloned().unwrap_or_default(),
-                        toks.get(1).cloned().unwrap_or_default(),
-                    )
-                };
-                match get_or_open_session(&shared, username, &pass).await {
+                let toks = Zeroizing::new(tokenize(eff_args));
+                let _user = toks.first().cloned().unwrap_or_default();
+                let pass = Zeroizing::new(toks.get(1).cloned().unwrap_or_default());
+                match get_or_open_session(&shared, username, pass.as_str()).await {
                     Ok(s) => {
                         folders = build_folders(&s).await;
                         session = Some(s);
@@ -293,7 +294,8 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     }
                     Err(e) => {
                         eprintln!("IMAP login error: {e}");
-                        c.send(&format!("{tag} NO [AUTHENTICATIONFAILED] {e}\r\n")).await?;
+                        c.send(&format!("{tag} NO [AUTHENTICATIONFAILED] {e}\r\n"))
+                            .await?;
                     }
                 }
             }
@@ -312,11 +314,8 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     } else {
                         format!("\\HasNoChildren {}", f.attr)
                     };
-                    c.send(&format!(
-                        "* {eff_cmd} ({attrs}) \"/\" \"{}\"\r\n",
-                        f.name
-                    ))
-                    .await?;
+                    c.send(&format!("* {eff_cmd} ({attrs}) \"/\" \"{}\"\r\n", f.name))
+                        .await?;
                 }
                 c.send(&format!("{tag} OK {eff_cmd} completed\r\n")).await?;
             }
@@ -345,14 +344,27 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         let unseen = mailbox.iter().filter(|m| m.meta.unread != 0).count();
                         c.send(&format!("* {n} EXISTS\r\n")).await?;
                         c.send("* 0 RECENT\r\n").await?;
-                        c.send("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n").await?;
-                        c.send("* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Deleted)] limited\r\n").await?;
-                        c.send(&format!("* OK [UIDVALIDITY {uidvalidity}] uids\r\n")).await?;
-                        c.send(&format!("* OK [UIDNEXT {uidnext}] next\r\n")).await?;
-                        c.send(&format!("* OK [UNSEEN {}] first unseen\r\n", unseen)).await?;
-                        let access = if eff_cmd == "EXAMINE" { "READ-ONLY" } else { "READ-WRITE" };
-                        c.send(&format!("{tag} OK [{access}] {eff_cmd} completed\r\n")).await?;
-                        eprintln!("IMAP -> {} SELECT OK: {n} EXISTS (unseen {unseen}, uidnext {uidnext})", folder.name);
+                        c.send("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n")
+                            .await?;
+                        c.send("* OK [PERMANENTFLAGS (\\Seen \\Flagged \\Deleted)] limited\r\n")
+                            .await?;
+                        c.send(&format!("* OK [UIDVALIDITY {uidvalidity}] uids\r\n"))
+                            .await?;
+                        c.send(&format!("* OK [UIDNEXT {uidnext}] next\r\n"))
+                            .await?;
+                        c.send(&format!("* OK [UNSEEN {}] first unseen\r\n", unseen))
+                            .await?;
+                        let access = if eff_cmd == "EXAMINE" {
+                            "READ-ONLY"
+                        } else {
+                            "READ-WRITE"
+                        };
+                        c.send(&format!("{tag} OK [{access}] {eff_cmd} completed\r\n"))
+                            .await?;
+                        eprintln!(
+                            "IMAP -> {} SELECT OK: {n} EXISTS (unseen {unseen}, uidnext {uidnext})",
+                            folder.name
+                        );
                     }
                     Err(e) => {
                         c.send(&format!("{tag} NO {e}\r\n")).await?;
@@ -404,7 +416,14 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     c.send(&format!("{tag} NO not authenticated\r\n")).await?;
                     continue;
                 }
-                let n = handle_fetch(&mut c, session.as_ref().unwrap(), &mailbox, eff_args, is_uid).await?;
+                let n = handle_fetch(
+                    &mut c,
+                    session.as_ref().unwrap(),
+                    &mailbox,
+                    eff_args,
+                    is_uid,
+                )
+                .await?;
                 c.send(&format!("{tag} OK FETCH completed\r\n")).await?;
                 eprintln!("IMAP -> FETCH OK: {n} messages returned");
             }
@@ -551,28 +570,32 @@ async fn handle_fetch<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let count = targets.len();
     for (seq, m) in targets {
         let msg = &m.meta;
-        let mut parts: Vec<String> = Vec::new();
+        let mut parts: Vec<Zeroizing<String>> = Vec::new();
 
         if is_uid || items_up.contains("UID") {
-            parts.push(format!("UID {}", m.uid));
+            parts.push(Zeroizing::new(format!("UID {}", m.uid)));
         }
         if items_up.contains("FLAGS") {
-            parts.push(format!("FLAGS ({})", flags_str(msg)));
+            parts.push(Zeroizing::new(format!("FLAGS ({})", flags_str(msg))));
         }
         if items_up.contains("RFC822.SIZE") {
-            parts.push(format!("RFC822.SIZE {}", msg.size.max(0)));
+            parts.push(Zeroizing::new(format!("RFC822.SIZE {}", msg.size.max(0))));
         }
         if items_up.contains("INTERNALDATE") {
-            parts.push(format!("INTERNALDATE \"{}\"", rfc2822_date(msg.time)));
+            parts.push(Zeroizing::new(format!(
+                "INTERNALDATE \"{}\"",
+                rfc2822_date(msg.time)
+            )));
         }
         if items_up.contains("ENVELOPE") {
-            parts.push(format!("ENVELOPE {}", envelope(msg)));
+            parts.push(Zeroizing::new(format!("ENVELOPE {}", envelope(msg))));
         }
         if items_up.contains("BODYSTRUCTURE") {
-            parts.push("BODYSTRUCTURE (\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 0 0)".to_string());
+            parts.push(Zeroizing::new("BODYSTRUCTURE (\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 0 0)".to_string()));
         }
 
-        let wants_body = (items_up.contains("RFC822") && !items_up.contains("RFC822.SIZE")
+        let wants_body = (items_up.contains("RFC822")
+            && !items_up.contains("RFC822.SIZE")
             && !items_up.contains("RFC822.HEADER"))
             || items_up.contains("BODY[]")
             || items_up.contains("BODY.PEEK[]");
@@ -587,18 +610,34 @@ async fn handle_fetch<S: AsyncRead + AsyncWrite + Unpin + Send>(
             } else {
                 "BODY[]"
             };
-            parts.push(format!("{section} {{{}}}\r\n{raw}", raw.len()));
+            parts.push(Zeroizing::new(format!(
+                "{section} {{{}}}\r\n{}",
+                raw.len(),
+                raw.as_str()
+            )));
         } else if wants_header {
-            let hdr = header_block(session, msg).await;
+            let hdr = Zeroizing::new(header_block(session, msg).await);
             let section = if items_up.contains("RFC822.HEADER") {
                 "RFC822.HEADER"
             } else {
                 "BODY[HEADER]"
             };
-            parts.push(format!("{section} {{{}}}\r\n{hdr}", hdr.len()));
+            parts.push(Zeroizing::new(format!(
+                "{section} {{{}}}\r\n{}",
+                hdr.len(),
+                hdr.as_str()
+            )));
         }
 
-        c.send(&format!("* {seq} FETCH ({})\r\n", parts.join(" "))).await?;
+        let joined = Zeroizing::new(
+            parts
+                .iter()
+                .map(|part| part.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let response = Zeroizing::new(format!("* {seq} FETCH ({})\r\n", joined.as_str()));
+        c.send(response.as_str()).await?;
     }
     Ok(count)
 }
@@ -628,7 +667,11 @@ async fn handle_store<S: AsyncRead + AsyncWrite + Unpin + Send>(
             let (lo, hi) = if let Some((a, b)) = part.split_once(':') {
                 let hidef = if is_uid { max_uid } else { max_seq as u32 };
                 let lo = a.parse::<u32>().unwrap_or(1);
-                let hi = if b == "*" { hidef } else { b.parse().unwrap_or(hidef) };
+                let hi = if b == "*" {
+                    hidef
+                } else {
+                    b.parse().unwrap_or(hidef)
+                };
                 (lo.min(hi), lo.max(hi))
             } else if part == "*" {
                 let v = if is_uid { max_uid } else { max_seq as u32 };
@@ -648,7 +691,10 @@ async fn handle_store<S: AsyncRead + AsyncWrite + Unpin + Send>(
     };
 
     if touches_seen && (add || remove) {
-        let ids: Vec<String> = targets.iter().map(|&i| mailbox[i].meta.id.clone()).collect();
+        let ids: Vec<String> = targets
+            .iter()
+            .map(|&i| mailbox[i].meta.id.clone())
+            .collect();
         let res = if add {
             session.client.mark_read(&ids).await
         } else {
@@ -701,24 +747,27 @@ async fn fetch_full(session: &Session, id: &str) -> Option<Message> {
     None
 }
 
-async fn build_rfc822(session: &Session, meta: &Message) -> String {
+async fn build_rfc822(session: &Session, meta: &Message) -> Zeroizing<String> {
     let full = match fetch_full(session, &meta.id).await {
         Some(m) => m,
-        None => return synth_headers(meta) + "\r\n\r\n(message unavailable)",
+        None => {
+            return Zeroizing::new(synth_headers(meta) + "\r\n\r\n(message unavailable)");
+        }
     };
-    let body = if full.is_encrypted == 0 {
+    let body = Zeroizing::new(if full.is_encrypted == 0 {
         full.body.clone()
     } else {
         session
             .keyring
             .decrypt_body(&full.body)
             .unwrap_or_else(|_| "(could not decrypt)".to_string())
-    };
-    if !full.header.trim().is_empty() {
-        format!("{}\r\n\r\n{}", full.header.trim_end(), body)
+    });
+    let raw = if !full.header.trim().is_empty() {
+        format!("{}\r\n\r\n{}", full.header.trim_end(), body.as_str())
     } else {
-        format!("{}\r\n\r\n{}", synth_headers(&full), body)
-    }
+        format!("{}\r\n\r\n{}", synth_headers(&full), body.as_str())
+    };
+    Zeroizing::new(raw)
 }
 
 async fn header_block(session: &Session, meta: &Message) -> String {
@@ -798,7 +847,9 @@ fn split_cmd(rest: &str) -> (&str, &str) {
 }
 fn split_once_ws(s: &str) -> (&str, &str) {
     let s = s.trim();
-    s.split_once(' ').map(|(a, b)| (a.trim(), b.trim())).unwrap_or((s, ""))
+    s.split_once(' ')
+        .map(|(a, b)| (a.trim(), b.trim()))
+        .unwrap_or((s, ""))
 }
 
 fn tokenize(s: &str) -> Vec<String> {

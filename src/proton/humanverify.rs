@@ -6,18 +6,17 @@
 //! CAPTCHA authentication fails closed if the local callback is unavailable.
 //! For email/sms the 6-digit code method is used.
 
-use std::io::{self, Write};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroize::Zeroize;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use zeroize::{Zeroize, Zeroizing};
 
-use axum::extract::State;
-use axum::extract::DefaultBodyLimit;
-use axum::routing::post;
 use axum::Router;
-use tokio::sync::{oneshot, Mutex};
+use axum::extract::DefaultBodyLimit;
+use axum::extract::State;
+use axum::routing::post;
+use tokio::sync::{Mutex, oneshot};
 
 use super::client::{ApiError, Client, HumanVerification, HvHeaders};
 
@@ -25,10 +24,7 @@ use super::client::{ApiError, Client, HumanVerification, HvHeaders};
 pub const CAPTURE_PORT: u16 = 8722;
 
 /// Runs the appropriate HV flow for the offered methods and returns the retry headers.
-pub async fn resolve(
-    _client: &Client,
-    hv: &HumanVerification,
-) -> Result<HvHeaders, ApiError> {
+pub async fn resolve(_client: &Client, hv: &HumanVerification) -> Result<HvHeaders, ApiError> {
     println!("\n⚠  Proton requires human verification.");
     println!("   Offered methods: {:?}", hv.methods);
 
@@ -49,20 +45,21 @@ pub async fn resolve(
 fn code_flow(method: &str) -> Result<HvHeaders, ApiError> {
     println!(
         "   Proton sent a verification code to your account's {}.",
-        if method == "email" { "email address" } else { "phone number" }
+        if method == "email" {
+            "email address"
+        } else {
+            "phone number"
+        }
     );
-    print!("   Enter the 6-digit code: ");
-    io::stdout().flush().ok();
-    let mut code = String::new();
-    io::stdin()
-        .read_line(&mut code)
-        .map_err(|e| ApiError::Other(format!("stdin read failed: {e}")))?;
-    let code = code.trim().to_string();
+    let code = Zeroizing::new(
+        rpassword::prompt_password("Enter the 6-digit verification code: ")
+            .map_err(|e| ApiError::Other(format!("verification code input failed: {e}")))?,
+    );
     if code.is_empty() {
         return Err(ApiError::Other("empty code".to_string()));
     }
     Ok(HvHeaders {
-        token: code,
+        token: code.to_string(),
         token_type: method.to_string(),
     })
 }
@@ -79,26 +76,37 @@ async fn captcha_flow(hv_token: &str) -> Result<HvHeaders, ApiError> {
     let mut nonce_bytes = [0u8; 24];
     getrandom::fill(&mut nonce_bytes)
         .map_err(|e| ApiError::Other(format!("could not create CAPTCHA callback nonce: {e}")))?;
-    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
-    let url = format!("https://verify.proton.me/?methods=captcha&embed=1&token={hv_token}&tb_nonce={nonce}");
+    let nonce = Zeroizing::new(URL_SAFE_NO_PAD.encode(nonce_bytes));
+    nonce_bytes.zeroize();
+    let url = Zeroizing::new(format!(
+        "https://verify.proton.me/?methods=captcha&embed=1&token={hv_token}&tb_nonce={nonce_text}",
+        nonce_text = nonce.as_str(),
+    ));
 
     // Local listener the userscript will POST the token to automatically.
     let (tx, rx) = oneshot::channel::<String>();
     let sink: TokenSink = Arc::new(Mutex::new(Some(tx)));
+    let callback_path = format!("/token/{}", nonce.as_str());
     let app = Router::new()
-        .route(&format!("/token/{nonce}"), post(recv_token))
+        .route(&callback_path, post(recv_token))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(sink);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", CAPTURE_PORT))
         .await
-        .map_err(|e| ApiError::Other(format!("could not start the protected local CAPTCHA callback: {e}")))?;
+        .map_err(|e| {
+            ApiError::Other(format!(
+                "could not start the protected local CAPTCHA callback: {e}"
+            ))
+        })?;
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
-    println!("\n   Opening Proton's CAPTCHA page. The challenge token is hidden from terminal output.");
-    if let Err(e) = open::that(&url) {
+    println!(
+        "\n   Opening Proton's CAPTCHA page. The challenge token is hidden from terminal output."
+    );
+    if let Err(e) = open::that(url.as_str()) {
         println!("   (could not open automatically: {e} — open the URL manually)");
     }
     println!();
@@ -111,7 +119,11 @@ async fn captcha_flow(hv_token: &str) -> Result<HvHeaders, ApiError> {
 
     let mut token = match token {
         Ok(Ok(value)) => value,
-        _ => return Err(ApiError::Other("CAPTCHA callback timed out or was cancelled; no token was accepted".to_string())),
+        _ => {
+            return Err(ApiError::Other(
+                "CAPTCHA callback timed out or was cancelled; no token was accepted".to_string(),
+            ));
+        }
     };
     if token.trim().is_empty() {
         token.zeroize();

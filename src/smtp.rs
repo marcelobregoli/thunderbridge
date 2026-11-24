@@ -3,14 +3,17 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use base64::engine::general_purpose::STANDARD as B64;
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::proton::send::send_mail;
 use crate::session::Session;
+use zeroize::Zeroizing;
 
 /// Plain TCP SMTP listener.
 pub async fn serve(username: String, port: u16) -> anyhow::Result<()> {
@@ -99,17 +102,20 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut session: Option<Session> = None;
     let mut rcpts: Vec<String> = Vec::new();
 
-    while let Some(line) = c.line().await? {
-        let up = line.trim_end().to_ascii_uppercase();
+    while let Some(raw_line) = c.line().await? {
+        // SMTP AUTH carries base64-encoded credentials in protocol lines.
+        let line = Zeroizing::new(raw_line);
+        let up = Zeroizing::new(line.trim_end().to_ascii_uppercase());
         let cmd = up.split_whitespace().next().unwrap_or("");
         match cmd {
             "EHLO" | "HELO" => {
-                c.send("250-thunderbridge\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n").await?;
+                c.send("250-thunderbridge\r\n250-AUTH PLAIN LOGIN\r\n250 OK\r\n")
+                    .await?;
             }
             "AUTH" => {
-                let pass = smtp_auth(&mut c, &line).await?;
+                let pass = smtp_auth(&mut c, line.as_str()).await?;
                 match pass {
-                    Some(p) => match Session::open(username, &p).await {
+                    Some(p) => match Session::open(username, p.as_str()).await {
                         Ok(s) => {
                             session = Some(s);
                             c.send("235 2.7.0 Authentication successful\r\n").await?;
@@ -139,7 +145,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
                 c.send("354 End data with <CR><LF>.<CR><LF>\r\n").await?;
                 let data = read_data(&mut c).await?;
-                match send_mail(session.as_ref().unwrap(), &data, &rcpts).await {
+                match send_mail(session.as_ref().unwrap(), data.as_slice(), &rcpts).await {
                     Ok(()) => c.send("250 2.0.0 Message sent\r\n").await?,
                     Err(e) => {
                         eprintln!("SMTP send error: {e}");
@@ -171,30 +177,37 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(
 async fn smtp_auth<S: AsyncRead + AsyncWrite + Unpin + Send>(
     c: &mut Conn<S>,
     line: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<Zeroizing<String>>> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let mech = parts.get(1).map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+    let mech = parts
+        .get(1)
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_default();
     if mech == "PLAIN" {
         // AUTH PLAIN [<b64>]
         let b64 = if let Some(arg) = parts.get(2) {
-            (*arg).to_string()
+            Zeroizing::new((*arg).to_string())
         } else {
             c.send("334 \r\n").await?;
-            c.line().await?.unwrap_or_default()
+            Zeroizing::new(c.line().await?.unwrap_or_default())
         };
-        let decoded = B64.decode(b64.trim()).unwrap_or_default();
+        let decoded = Zeroizing::new(B64.decode(b64.trim()).unwrap_or_default());
         // \0user\0pass
         let mut it = decoded.split(|&b| b == 0);
         it.next(); // authzid
         it.next(); // authcid (username)
-        let pass = it.next().map(|p| String::from_utf8_lossy(p).into_owned());
+        let pass = it
+            .next()
+            .map(|p| Zeroizing::new(String::from_utf8_lossy(p).into_owned()));
         Ok(pass)
     } else if mech == "LOGIN" {
         c.send("334 VXNlcm5hbWU6\r\n").await?; // "Username:"
-        let _user = c.line().await?.unwrap_or_default();
+        let user_b64 = Zeroizing::new(c.line().await?.unwrap_or_default());
+        let _user = Zeroizing::new(B64.decode(user_b64.trim()).unwrap_or_default());
         c.send("334 UGFzc3dvcmQ6\r\n").await?; // "Password:"
-        let pass_b64 = c.line().await?.unwrap_or_default();
-        let pass = String::from_utf8_lossy(&B64.decode(pass_b64.trim()).unwrap_or_default()).into_owned();
+        let pass_b64 = Zeroizing::new(c.line().await?.unwrap_or_default());
+        let pass_bytes = Zeroizing::new(B64.decode(pass_b64.trim()).unwrap_or_default());
+        let pass = Zeroizing::new(String::from_utf8_lossy(pass_bytes.as_slice()).into_owned());
         Ok(Some(pass))
     } else {
         Ok(None)
@@ -204,14 +217,15 @@ async fn smtp_auth<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// Reads the DATA body until the "." line (dot-unstuffing).
 async fn read_data<S: AsyncRead + AsyncWrite + Unpin + Send>(
     c: &mut Conn<S>,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     const MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
-    let mut out = Vec::new();
-    while let Some(line) = c.line().await? {
-        if line == "." {
+    let mut out = Zeroizing::new(Vec::new());
+    while let Some(raw_line) = c.line().await? {
+        let line = Zeroizing::new(raw_line);
+        if line.as_str() == "." {
             break;
         }
-        let l = line.strip_prefix('.').unwrap_or(&line);
+        let l = line.strip_prefix('.').unwrap_or(line.as_str());
         if out.len().saturating_add(l.len()).saturating_add(2) > MAX_MESSAGE_BYTES {
             anyhow::bail!("SMTP message exceeds the 25 MiB safety limit");
         }
@@ -229,5 +243,54 @@ fn extract_addr(line: &str) -> Option<String> {
         Some(line[start + 1..end].to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn smtp_auth_plain_extracts_bridge_password() {
+        let (_client, server) = duplex(1024);
+        let (reader, writer) = split(server);
+        let mut conn = Conn {
+            reader: BufReader::new(reader),
+            writer,
+        };
+        let payload = B64.encode(b"\0bridge-user\0bridge-password");
+        let line = format!("AUTH PLAIN {payload}");
+
+        let password = smtp_auth(&mut conn, &line)
+            .await
+            .expect("parse AUTH PLAIN")
+            .expect("password present");
+        assert_eq!(password.as_str(), "bridge-password");
+    }
+
+    #[tokio::test]
+    async fn smtp_auth_login_extracts_bridge_password() {
+        let (mut client, server) = duplex(1024);
+        let (reader, writer) = split(server);
+        let mut conn = Conn {
+            reader: BufReader::new(reader),
+            writer,
+        };
+        let input = format!(
+            "{}\r\n{}\r\n",
+            B64.encode("bridge-user"),
+            B64.encode("bridge-password")
+        );
+        client
+            .write_all(input.as_bytes())
+            .await
+            .expect("write AUTH LOGIN responses");
+
+        let password = smtp_auth(&mut conn, "AUTH LOGIN")
+            .await
+            .expect("parse AUTH LOGIN")
+            .expect("password present");
+        assert_eq!(password.as_str(), "bridge-password");
     }
 }

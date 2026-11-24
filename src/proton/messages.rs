@@ -2,6 +2,7 @@
 //! Body decryption (PGP) lives in the `crypto` module.
 
 use serde::Deserialize;
+use zeroize::Zeroize;
 
 use super::client::{ApiError, Client};
 
@@ -72,6 +73,16 @@ pub struct Message {
     pub label_ids: Vec<String>,
 }
 
+impl Drop for Message {
+    fn drop(&mut self) {
+        self.id.zeroize();
+        self.subject.zeroize();
+        self.address_id.zeroize();
+        self.body.zeroize();
+        self.header.zeroize();
+    }
+}
+
 impl Client {
     /// Lists messages (metadata) under a label (folder).
     pub async fn list_messages(
@@ -87,9 +98,8 @@ impl Client {
             #[serde(rename = "Messages", default)]
             messages: Vec<Message>,
         }
-        let path = format!(
-            "/messages?Label={label}&Page={page}&PageSize={page_size}&Sort=Time&Desc=1"
-        );
+        let path =
+            format!("/messages?Label={label}&Page={page}&PageSize={page_size}&Sort=Time&Desc=1");
         let r: R = self.get_json(&path).await?;
         Ok((r.total, r.messages))
     }

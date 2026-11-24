@@ -12,13 +12,12 @@ mod store;
 mod tls;
 mod uidmap;
 
-use std::io::{self, Write};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use clap::{Parser, Subcommand};
 
 use proton::client::ApiError;
-use proton::{humanverify, Client};
+use proton::{Client, humanverify};
 
 #[derive(Parser)]
 #[command(name = "thunderbridge", about = "ProtonMail ↔ Thunderbird bridge")]
@@ -37,9 +36,7 @@ enum Command {
     /// List saved sessions.
     Status,
     /// Remove a saved session.
-    Logout {
-        username: String,
-    },
+    Logout { username: String },
     /// Start the IMAP server (Thunderbird connects to 127.0.0.1:1143).
     Imap {
         username: String,
@@ -115,8 +112,8 @@ async fn main() {
 /// Writes and enables the systemd user service.
 fn cmd_install_service(username: &str, tls: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let dirs = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
+    let dirs =
+        directories::BaseDirs::new().ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
     let unit_dir = dirs.config_dir().join("systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("thunderbridge.service");
@@ -294,21 +291,13 @@ async fn run_serve(
     Ok(())
 }
 
-fn prompt_line(label: &str) -> anyhow::Result<String> {
-    print!("{label}");
-    io::stdout().flush()?;
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    Ok(s.trim().to_string())
-}
-
 async fn cmd_auth(username: &str) -> anyhow::Result<()> {
     let mut client = Client::new()?;
 
-    let mut password = rpassword::prompt_password("Password: ")?;
+    let password = Zeroizing::new(rpassword::prompt_password("Password: ")?);
 
     // Prepare the SRP proof.
-    let prepared = client.prepare_auth(username, &password).await?;
+    let prepared = client.prepare_auth(username, password.as_str()).await?;
 
     // Send /auth; on 9001, resolve human-verification and retry once.
     let auth = match client.submit_auth(&prepared, None).await {
@@ -325,39 +314,35 @@ async fn cmd_auth(username: &str) -> anyhow::Result<()> {
         if auth.two_factor.totp != 1 {
             anyhow::bail!("only TOTP 2FA is supported");
         }
-        let code = prompt_line("2FA TOTP code: ")?;
-        client.auth_totp(&code).await?;
+        let code = Zeroizing::new(rpassword::prompt_password("2FA TOTP code: ")?);
+        client.auth_totp(code.as_str()).await?;
     }
 
     // Mailbox password: the login password in single-password mode, asked separately
     // in two-password mode.
     let mailbox_password = if auth.password_mode == 1 {
-        password.clone()
+        password.to_string()
     } else {
         rpassword::prompt_password("Mailbox password: ")?
     };
 
     // Fetch the key salts (needed to unlock keys later); if it fails, still save the session.
     let mut session =
-        store::CachedSession::from_auth(&auth, password.clone(), mailbox_password);
-    password.zeroize();
-    match client
-        .get_json::<serde_json::Value>("/keys/salts")
-        .await
-    {
+        store::CachedSession::from_auth(&auth, password.to_string(), mailbox_password);
+    match client.get_json::<serde_json::Value>("/keys/salts").await {
         Ok(v) => session.key_salts = v,
         Err(e) => eprintln!("warning: could not fetch key salts ({e}); will retry later"),
     }
 
-    let mut bridge_password = store::encrypt_and_save(username, &session)?;
+    let bridge_password = Zeroizing::new(store::encrypt_and_save(username, &session)?);
 
     println!("\n✓ Login successful. Session saved encrypted.");
     println!("\n  Bridge password (enter this in Thunderbird, NOT your real Proton password):");
-    println!("      {bridge_password}");
-    println!("\n  Thunderbird settings (once the servers are running):");
-    println!("      IMAP  127.0.0.1:1143   user: {username}   password: bridge password");
-    println!("      SMTP  127.0.0.1:1025   user: {username}   password: bridge password");
-    bridge_password.zeroize();
+    println!("      {}", bridge_password.as_str());
+    println!("\n  Thunderbird settings (when started with ./run.sh <username>):");
+    println!("      IMAP  127.0.0.1:1993   SSL/TLS   user: {username}   password: bridge password");
+    println!("      SMTP  127.0.0.1:1465   SSL/TLS   user: {username}   password: bridge password");
+    println!("      Use the bridge password above, never your Proton password.");
     Ok(())
 }
 
@@ -373,7 +358,6 @@ fn cmd_status() -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 
 fn cmd_logout(username: &str) -> anyhow::Result<()> {
     if store::remove(username)? {
