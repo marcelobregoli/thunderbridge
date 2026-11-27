@@ -6,6 +6,10 @@ the ProtonMail web API, performs the SRP login (including 2FA and the human-veri
 CAPTCHA), unlocks your PGP keys locally, and presents your mailbox as an ordinary
 IMAP/SMTP server bound to `127.0.0.1`.
 
+IMAP/SMTP server bound to `127.0.0.1`.
+
+**Project case study:** https://marcelo-bregoli.pages.dev/projects/thunderbridge.html
+
 Written in Rust. No telemetry and no third parties: everything runs on your machine, and
 your ProtonMail password is never written to disk in plaintext.
 
