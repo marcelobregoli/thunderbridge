@@ -8,7 +8,7 @@ IMAP/SMTP server bound to `127.0.0.1`.
 
 IMAP/SMTP server bound to `127.0.0.1`.
 
-**Project case study:** https://marcelo-bregoli.pages.dev/projects/thunderbridge.html
+**Project case study:** https://marcelo-bregoli.pages.dev/projects/thunderbridge
 
 Written in Rust. No telemetry and no third parties: everything runs on your machine, and
 your ProtonMail password is never written to disk in plaintext.
